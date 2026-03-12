@@ -4,7 +4,7 @@
 
 $port        = 6274
 $idleTimeout = 30   # minutes
-$binary      = "$env:LOCALAPPDATA\codebase-memory-mcp\codebase-memory-mcp.exe"
+$binary      = "C:\Users\nate.hunter\repos\codebase-memory-mcp\codebase-memory-mcp.exe"
 
 if (-not (Test-Path $binary)) {
     Write-Error "Binary not found at $binary"
@@ -27,5 +27,5 @@ $listening = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Si
 if ($listening) {
     Write-Host "Server started successfully"
 } else {
-    Write-Warning "Server may not have started — check for errors"
+    Write-Warning "Server may not have started - check for errors"
 }
