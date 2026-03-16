@@ -1,3 +1,5 @@
+//go:build windows
+
 // Version: 0.2.0
 // cmd/mcp-wrapper/lifecycle_test.go
 package main
