@@ -1,3 +1,4 @@
+# Version: 0.4.10
 # Singleton launcher for codebase-memory-mcp in SSE mode.
 # Safe to call multiple times — starts the server only if not already running.
 # Usage: powershell -ExecutionPolicy Bypass -File launch-sse.ps1
