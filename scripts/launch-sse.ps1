@@ -5,7 +5,7 @@
 
 $port        = 6274
 $idleTimeout = 30   # minutes
-$binary      = "C:\Users\nate.hunter\repos\codebase-memory-mcp\codebase-memory-mcp.exe"
+$binary      = Join-Path $PSScriptRoot "..\codebase-memory-mcp.exe"
 
 if (-not (Test-Path $binary)) {
     Write-Error "Binary not found at $binary"
