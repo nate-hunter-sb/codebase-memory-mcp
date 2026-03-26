@@ -52,10 +52,13 @@ func (lm *LifecycleManager) Start() error {
 		"--idle-timeout", fmt.Sprintf("%d", lm.idleTimeout),
 	)
 
-	// Detach: server must survive wrapper exit.
-	// DETACHED_PROCESS (0x8) + CREATE_NEW_PROCESS_GROUP (0x200)
+	// CREATE_NO_WINDOW (0x08000000): suppress the console window entirely.
+	// DETACHED_PROCESS would allocate a *new* console (causing a visible flash);
+	// CREATE_NO_WINDOW prevents any console from being created.
+	// CREATE_NEW_PROCESS_GROUP (0x200): isolates signal handling so Ctrl+C
+	// sent to the wrapper doesn't propagate to the server.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x00000008 | 0x00000200,
+		CreationFlags: 0x08000000 | 0x00000200,
 	}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
