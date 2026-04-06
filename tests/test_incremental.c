@@ -18,6 +18,7 @@
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+#include <yyjson/yyjson.h>
 
 #include <stdarg.h>
 #include <string.h>
@@ -141,6 +142,47 @@ static int count_in_response(const char *resp, const char *key) {
     if (p)
         return atoi(p + strlen(pattern));
     return -1;
+}
+
+static char *extract_text_content(const char *mcp_result) {
+    if (!mcp_result)
+        return NULL;
+    yyjson_doc *doc = yyjson_read(mcp_result, strlen(mcp_result), 0);
+    if (!doc)
+        return strdup(mcp_result);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *content = yyjson_obj_get(root, "content");
+    if (!content || !yyjson_is_arr(content)) {
+        yyjson_doc_free(doc);
+        return strdup(mcp_result);
+    }
+    yyjson_val *item = yyjson_arr_get(content, 0);
+    if (!item) {
+        yyjson_doc_free(doc);
+        return strdup(mcp_result);
+    }
+    yyjson_val *text = yyjson_obj_get(item, "text");
+    const char *str = yyjson_get_str(text);
+    char *result = str ? strdup(str) : strdup(mcp_result);
+    yyjson_doc_free(doc);
+    return result;
+}
+
+static int response_array_size(const char *resp, const char *key) {
+    char *text = extract_text_content(resp);
+    if (!text)
+        return -1;
+
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    free(text);
+    if (!doc)
+        return -1;
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *arr = yyjson_obj_get(root, key);
+    int n = (arr && yyjson_is_arr(arr)) ? (int)yyjson_arr_size(arr) : -1;
+    yyjson_doc_free(doc);
+    return n;
 }
 
 /* ── Direct store queries (more reliable than MCP for tests) ────── */
@@ -1462,13 +1504,17 @@ TEST(tool_sc_compact) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"import\",\"mode\":\"compact\",\"limit\":5}",
+                              "\"pattern\":\"incr_test_injected\",\"mode\":\"compact\",\"limit\":5}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
-    /* compact mode has "results" key with enriched matches */
+    /* compact mode has results and raw matches, but no source blobs */
     ASSERT(resp_has_key(r, "results"));
     ASSERT(resp_has_key(r, "total_results"));
+    ASSERT(resp_has_key(r, "raw_matches"));
+    ASSERT(resp_lacks_key(r, "source"));
+    ASSERT(resp_lacks_key(r, "files"));
+    ASSERT_GT(response_array_size(r, "results"), 0);
     free(r);
     PASS();
 }
@@ -1477,12 +1523,13 @@ TEST(tool_sc_full) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"FastAPI\",\"mode\":\"full\",\"limit\":3}",
+                              "\"pattern\":\"incr_test_injected\",\"mode\":\"full\",\"limit\":3}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
-    /* full mode includes source code */
-    ASSERT(resp_has_key(r, "results") || resp_has_key(r, "raw_matches"));
+    ASSERT(resp_has_key(r, "results"));
+    ASSERT(resp_has_key(r, "source"));
+    ASSERT_GT(response_array_size(r, "results"), 0);
     free(r);
     PASS();
 }
@@ -1491,12 +1538,14 @@ TEST(tool_sc_files) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"def \",\"mode\":\"files\",\"limit\":10}",
+                              "\"pattern\":\"incr_test\",\"mode\":\"files\",\"limit\":10}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
-    /* files mode has "files" key, NOT "results" */
     ASSERT(resp_has_key(r, "files"));
+    ASSERT(resp_lacks_key(r, "results"));
+    ASSERT(resp_lacks_key(r, "raw_matches"));
+    ASSERT_GT(response_array_size(r, "files"), 0);
     free(r);
     PASS();
 }
@@ -1507,10 +1556,12 @@ TEST(tool_sc_regex) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"def\\\\s+\\\\w+_handler\",\"regex\":true,\"limit\":5}",
+                              "\"pattern\":\"def\\\\s+incr_test_\\\\w+\",\"regex\":true,\"limit\":5}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_GT(count_in_response(r, "total_results"), 0);
+    ASSERT_NOT_NULL(strstr(r, "incr_test_injected"));
     free(r);
     PASS();
 }
@@ -1521,10 +1572,12 @@ TEST(tool_sc_file_pattern) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"class\",\"file_pattern\":\"*.py\",\"limit\":5}",
+                              "\"pattern\":\"incr_test_injected\","
+                              "\"file_pattern\":\"*applications.py\",\"limit\":5}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_NOT_NULL(strstr(r, "\"file\":\"fastapi/applications.py\""));
     free(r);
     PASS();
 }
@@ -1533,10 +1586,12 @@ TEST(tool_sc_path_filter) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"import\",\"path_filter\":\"fastapi/\",\"limit\":5}",
+                              "\"pattern\":\"incr_test_injected\","
+                              "\"path_filter\":\"^fastapi/\",\"limit\":5}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_NOT_NULL(strstr(r, "\"file\":\"fastapi/applications.py\""));
     free(r);
     PASS();
 }
@@ -1547,10 +1602,12 @@ TEST(tool_sc_context) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"FastAPI\",\"context\":3,\"limit\":3}",
+                              "\"pattern\":\"incr_test_injected\",\"context\":1,\"limit\":3}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT(resp_has_key(r, "context"));
+    ASSERT(resp_has_key(r, "context_start"));
     free(r);
     PASS();
 }
@@ -2060,6 +2117,8 @@ TEST(tool_sc_limit_1) {
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_EQ(response_array_size(r, "results"), 1);
+    ASSERT_GT(count_in_response(r, "total_results"), 1);
     free(r);
     PASS();
 }
@@ -2072,6 +2131,8 @@ TEST(tool_sc_limit_50) {
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_GT(response_array_size(r, "results"), 1);
+    ASSERT_LTE(response_array_size(r, "results"), 50);
     free(r);
     PASS();
 }
@@ -2082,14 +2143,16 @@ TEST(tool_sc_combined) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"class\","
+                              "\"pattern\":\"incr_test\","
                               "\"mode\":\"compact\","
-                              "\"file_pattern\":\"*.py\","
-                              "\"path_filter\":\"fastapi/\","
+                              "\"file_pattern\":\"*applications.py\","
+                              "\"path_filter\":\"^fastapi/\","
                               "\"limit\":5,\"context\":2}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_NOT_NULL(strstr(r, "\"file\":\"fastapi/applications.py\""));
+    ASSERT(resp_has_key(r, "context"));
     free(r);
     PASS();
 }
@@ -2484,10 +2547,12 @@ TEST(tool_sc_regex_false) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"FastAPI\",\"regex\":false,\"limit\":3}",
+                              "\"pattern\":\"def\\\\s+incr_test_\\\\w+\",\"regex\":false,\"limit\":3}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT_EQ(count_in_response(r, "total_results"), 0);
+    ASSERT_EQ(response_array_size(r, "results"), 0);
     free(r);
     PASS();
 }
@@ -2498,10 +2563,12 @@ TEST(tool_sc_context_zero) {
     double ms;
     char *r = call_tool_timed("search_code", &ms,
                               "{\"project\":\"%s\","
-                              "\"pattern\":\"import\",\"context\":0,\"limit\":5}",
+                              "\"pattern\":\"incr_test_injected\",\"context\":0,\"limit\":5}",
                               g_project);
     TOOL_OK(r, ms);
     NOT_ERROR(r);
+    ASSERT(resp_lacks_key(r, "context"));
+    ASSERT(resp_lacks_key(r, "context_start"));
     free(r);
     PASS();
 }
