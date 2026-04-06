@@ -2431,6 +2431,50 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
+static int grep_match_cmp(const void *a, const void *b) {
+    const grep_match_t *ga = (const grep_match_t *)a;
+    const grep_match_t *gb = (const grep_match_t *)b;
+    int by_file = strcmp(ga->file, gb->file);
+    if (by_file != 0) {
+        return by_file;
+    }
+    if (ga->line != gb->line) {
+        return ga->line - gb->line;
+    }
+    return strcmp(ga->content, gb->content);
+}
+
+static void free_indexed_file_list(char **indexed_files, int indexed_count) {
+    if (!indexed_files) {
+        return;
+    }
+    for (int fi = 0; fi < indexed_count; fi++) {
+        free(indexed_files[fi]);
+    }
+    free(indexed_files);
+}
+
+static bool load_scoped_indexed_files(cbm_mcp_server_t *srv, const char *project,
+                                      char ***indexed_files, int *indexed_count) {
+    cbm_store_t *pre_store = resolve_store(srv, project);
+    if (!pre_store) {
+        return false;
+    }
+    *indexed_files = NULL;
+    *indexed_count = 0;
+    if (cbm_store_list_files(pre_store, project, indexed_files, indexed_count) != CBM_STORE_OK) {
+        return false;
+    }
+    if (*indexed_count <= 0) {
+        free_indexed_file_list(*indexed_files, *indexed_count);
+        *indexed_files = NULL;
+        *indexed_count = 0;
+        return false;
+    }
+    return true;
+}
+
+#ifndef _WIN32
 /* Build the grep command string based on scoped vs recursive mode */
 static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
@@ -2453,6 +2497,306 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         }
     }
 }
+#endif
+
+#ifdef _WIN32
+static bool search_glob_match_charclass(const char *pattern, char ch, const char **next_pattern) {
+    bool negate = false;
+    bool matched = false;
+    const char *p = pattern;
+
+    if (*p == '!' || *p == '^') {
+        negate = true;
+        p++;
+    }
+
+    while (*p && *p != ']') {
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+            if (ch >= p[0] && ch <= p[2]) {
+                matched = true;
+            }
+            p += 3;
+            continue;
+        }
+        if (*p == ch) {
+            matched = true;
+        }
+        p++;
+    }
+
+    if (*p != ']') {
+        return false;
+    }
+
+    *next_pattern = p + SKIP_ONE;
+    return negate ? !matched : matched;
+}
+
+static bool search_glob_match(const char *pattern, const char *text) {
+    if (!pattern || !*pattern) {
+        return !text || !*text;
+    }
+
+    if (*pattern == '*') {
+        while (*pattern == '*') {
+            pattern++;
+        }
+        if (!*pattern) {
+            return true;
+        }
+        for (const char *p = text; p; p++) {
+            if (search_glob_match(pattern, p)) {
+                return true;
+            }
+            if (!*p) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    if (!text || !*text) {
+        return false;
+    }
+
+    if (*pattern == '?') {
+        return search_glob_match(pattern + SKIP_ONE, text + SKIP_ONE);
+    }
+
+    if (*pattern == '[') {
+        const char *next_pattern = NULL;
+        if (!search_glob_match_charclass(pattern + SKIP_ONE, *text, &next_pattern)) {
+            return false;
+        }
+        return search_glob_match(next_pattern, text + SKIP_ONE);
+    }
+
+    if (*pattern != *text) {
+        return false;
+    }
+    return search_glob_match(pattern + SKIP_ONE, text + SKIP_ONE);
+}
+
+static bool file_pattern_has_path_sep(const char *file_pattern) {
+    return file_pattern && (strchr(file_pattern, '/') || strchr(file_pattern, '\\'));
+}
+
+static bool search_path_matches_file_pattern(const char *relative_path, const char *file_pattern) {
+    if (!file_pattern || !file_pattern[0]) {
+        return true;
+    }
+
+    char normalized_pattern[CBM_SZ_1K];
+    snprintf(normalized_pattern, sizeof(normalized_pattern), "%s", file_pattern);
+    cbm_normalize_path_sep(normalized_pattern);
+
+    const char *match_target = relative_path;
+    if (!file_pattern_has_path_sep(normalized_pattern)) {
+        const char *basename = strrchr(relative_path, '/');
+        match_target = basename ? basename + SKIP_ONE : relative_path;
+    }
+    return search_glob_match(normalized_pattern, match_target);
+}
+
+static bool search_path_allowed(const char *relative_path, const char *file_pattern,
+                                bool has_path_filter, cbm_regex_t *path_regex) {
+    if (!search_path_matches_file_pattern(relative_path, file_pattern)) {
+        return false;
+    }
+    if (has_path_filter && cbm_regexec(path_regex, relative_path, 0, NULL, 0) != CBM_REG_OK) {
+        return false;
+    }
+    return true;
+}
+
+static bool append_grep_match(grep_match_t **gm, int *gm_count, int *gm_cap, const char *file,
+                              int line, const char *content) {
+    if (*gm_count >= *gm_cap) {
+        int new_cap = (*gm_cap == 0) ? CBM_SZ_64 : *gm_cap * PAIR_LEN;
+        grep_match_t *grown = safe_realloc(*gm, (size_t)new_cap * sizeof(grep_match_t));
+        if (!grown) {
+            *gm = NULL;
+            *gm_cap = 0;
+            *gm_count = 0;
+            return false;
+        }
+        *gm = grown;
+        *gm_cap = new_cap;
+    }
+
+    snprintf((*gm)[*gm_count].file, sizeof((*gm)[0].file), "%s", file);
+    (*gm)[*gm_count].line = line;
+    snprintf((*gm)[*gm_count].content, sizeof((*gm)[0].content), "%s", content);
+    sanitize_ascii((*gm)[*gm_count].content);
+    (*gm_count)++;
+    return true;
+}
+
+static void trim_line_endings(char *line) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+        line[--len] = '\0';
+    }
+}
+
+static bool search_file_is_binary(FILE *file) {
+    unsigned char probe[CBM_SZ_4K];
+    size_t nread = fread(probe, 1, sizeof(probe), file);
+    rewind(file);
+    return memchr(probe, '\0', nread) != NULL;
+}
+
+static bool search_windows_should_recurse_dir(const char *root_path, const char *relative_path) {
+    char abs_path[CBM_SZ_4K];
+    snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, relative_path);
+    cbm_normalize_path_sep(abs_path);
+
+    DWORD attrs = GetFileAttributesA(abs_path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+static void search_windows_file(const char *root_path, const char *relative_path, const char *pattern,
+                                bool use_regex, cbm_regex_t *line_regex, grep_match_t **gm,
+                                int *gm_count, int *gm_cap, int grep_limit) {
+    if (*gm_count >= grep_limit) {
+        return;
+    }
+
+    char abs_path[CBM_SZ_4K];
+    snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, relative_path);
+    cbm_normalize_path_sep(abs_path);
+
+    FILE *file = fopen(abs_path, "rb");
+    if (!file) {
+        return;
+    }
+    if (search_file_is_binary(file)) {
+        fclose(file);
+        return;
+    }
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    int line_no = 0;
+    while (*gm_count < grep_limit && cbm_getline(&line, &line_cap, file) >= 0) {
+        bool matched = false;
+        line_no++;
+        trim_line_endings(line);
+        if (use_regex) {
+            matched = cbm_regexec(line_regex, line, 0, NULL, 0) == CBM_REG_OK;
+        } else {
+            matched = strstr(line, pattern) != NULL;
+        }
+        if (matched && !append_grep_match(gm, gm_count, gm_cap, relative_path, line_no, line)) {
+            break;
+        }
+    }
+
+    free(line);
+    fclose(file);
+}
+
+static void search_windows_tree(const char *root_path, const char *relative_dir, const char *pattern,
+                                bool use_regex, cbm_regex_t *line_regex, const char *file_pattern,
+                                bool has_path_filter, cbm_regex_t *path_regex, grep_match_t **gm,
+                                int *gm_count, int *gm_cap, int grep_limit) {
+    if (*gm_count >= grep_limit) {
+        return;
+    }
+
+    char dir_path[CBM_SZ_4K];
+    if (relative_dir && relative_dir[0]) {
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", root_path, relative_dir);
+    } else {
+        snprintf(dir_path, sizeof(dir_path), "%s", root_path);
+    }
+    cbm_normalize_path_sep(dir_path);
+
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return;
+    }
+
+    cbm_dirent_t *entry = NULL;
+    while (*gm_count < grep_limit && (entry = cbm_readdir(dir)) != NULL) {
+        char relative_path[CBM_SZ_4K];
+        if (relative_dir && relative_dir[0]) {
+            snprintf(relative_path, sizeof(relative_path), "%s/%s", relative_dir, entry->name);
+        } else {
+            snprintf(relative_path, sizeof(relative_path), "%s", entry->name);
+        }
+        cbm_normalize_path_sep(relative_path);
+
+        if (entry->is_dir) {
+            if (!search_windows_should_recurse_dir(root_path, relative_path)) {
+                continue;
+            }
+            search_windows_tree(root_path, relative_path, pattern, use_regex, line_regex,
+                                file_pattern, has_path_filter, path_regex, gm, gm_count, gm_cap,
+                                grep_limit);
+            continue;
+        }
+
+        if (!search_path_allowed(relative_path, file_pattern, has_path_filter, path_regex)) {
+            continue;
+        }
+        search_windows_file(root_path, relative_path, pattern, use_regex, line_regex, gm, gm_count,
+                            gm_cap, grep_limit);
+    }
+
+    cbm_closedir(dir);
+}
+
+static grep_match_t *collect_windows_matches(cbm_mcp_server_t *srv, const char *project,
+                                             const char *root_path, const char *pattern,
+                                             bool use_regex, const char *file_pattern,
+                                             bool has_path_filter, cbm_regex_t *path_regex,
+                                             int grep_limit, int *out_count) {
+    grep_match_t *gm = NULL;
+    int gm_cap = 0;
+    int gm_count = 0;
+    cbm_regex_t line_regex;
+    bool regex_ready = true;
+
+    if (use_regex) {
+        regex_ready =
+            cbm_regcomp(&line_regex, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
+    }
+    if (!regex_ready) {
+        *out_count = 0;
+        return NULL;
+    }
+
+    char **indexed_files = NULL;
+    int indexed_count = 0;
+    bool scoped = load_scoped_indexed_files(srv, project, &indexed_files, &indexed_count);
+    if (scoped) {
+        for (int fi = 0; fi < indexed_count && gm_count < grep_limit; fi++) {
+            cbm_normalize_path_sep(indexed_files[fi]);
+            if (!search_path_allowed(indexed_files[fi], file_pattern, has_path_filter, path_regex)) {
+                continue;
+            }
+            search_windows_file(root_path, indexed_files[fi], pattern, use_regex,
+                                use_regex ? &line_regex : NULL, &gm, &gm_count, &gm_cap,
+                                grep_limit);
+        }
+        free_indexed_file_list(indexed_files, indexed_count);
+    } else {
+        search_windows_tree(root_path, "", pattern, use_regex, use_regex ? &line_regex : NULL,
+                            file_pattern, has_path_filter, path_regex, &gm, &gm_count, &gm_cap,
+                            grep_limit);
+    }
+
+    if (use_regex) {
+        cbm_regfree(&line_regex);
+    }
+    *out_count = gm_count;
+    return gm;
+}
+#endif
 
 /* Build deduplicated file list from search results + raw matches. */
 static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_result_t *sr,
@@ -2641,6 +2985,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     return result;
 }
 
+#ifndef _WIN32
 /* Read grep output from fp, parse file:line:content format, apply path filter,
  * and return a dynamically-allocated grep_match_t array. */
 /* Strip root path prefix from a file path. */
@@ -2649,7 +2994,7 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
         return path;
     }
     const char *p = path + root_len;
-    if (*p == '/') {
+    if (*p == '/' || *p == '\\') {
         p++;
     }
     return p;
@@ -2706,6 +3051,7 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
     *out_count = gm_count;
     return gm;
 }
+#endif
 
 /* Find the tightest node containing a line in a file. Returns index or -1. */
 static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
@@ -2788,7 +3134,9 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
 static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
                                    const char *project, search_result_t **sr, int *sr_count,
                                    int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap) {
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    if (gm_count > SKIP_ONE) {
+        qsort(gm, gm_count, sizeof(grep_match_t), grep_match_cmp);
+    }
     int i = 0;
     while (i < gm_count) {
         const char *cur_file = gm[i].file;
@@ -2809,17 +3157,13 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
     }
 }
 
+#ifndef _WIN32
 /* Write indexed file list for scoped grep. Returns true if scoped. */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
                                   const char *filelist) {
-    cbm_store_t *pre_store = resolve_store(srv, project);
-    if (!pre_store) {
-        return false;
-    }
     char **indexed_files = NULL;
     int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK ||
-        indexed_count == 0) {
+    if (!load_scoped_indexed_files(srv, project, &indexed_files, &indexed_count)) {
         return false;
     }
     FILE *fl = fopen(filelist, "w");
@@ -2831,12 +3175,10 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         (void)fclose(fl);
         ok = true;
     }
-    for (int fi = 0; fi < indexed_count; fi++) {
-        free(indexed_files[fi]);
-    }
-    free(indexed_files);
+    free_indexed_file_list(indexed_files, indexed_count);
     return ok;
 }
+#endif
 
 /* Parse search mode string (0=compact, 1=full, 2=files). */
 static int parse_search_mode(const char *mode_str) {
@@ -2854,6 +3196,15 @@ static int parse_search_mode(const char *mode_str) {
 
 /* Validate shell-safe arguments for search. */
 static bool validate_search_args(const char *root_path, const char *file_pattern) {
+#ifdef _WIN32
+    if (!cbm_validate_path_arg(root_path)) {
+        return false;
+    }
+    if (file_pattern && !cbm_validate_path_arg(file_pattern)) {
+        return false;
+    }
+    return true;
+#else
     if (!cbm_validate_shell_arg(root_path)) {
         return false;
     }
@@ -2861,15 +3212,13 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
         return false;
     }
     return true;
+#endif
 }
 
 /* Write pattern to a temp file for grep -f. Returns true on success. */
+#ifndef _WIN32
 static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-#ifdef _WIN32
-    snprintf(tmpfile, tmpfile_sz, "/tmp/cbm_search_%d.pat", (int)_getpid());
-#else
     snprintf(tmpfile, tmpfile_sz, "/tmp/cbm_search_%d.pat", getpid());
-#endif
     FILE *tf = fopen(tmpfile, "w");
     if (!tf) {
         return false;
@@ -2878,6 +3227,7 @@ static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *patter
     (void)fclose(tf);
     return true;
 }
+#endif
 
 /* Compile a path filter regex. Returns true if compiled successfully. */
 static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
@@ -2931,6 +3281,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(_err);
         return _res;
     }
+    cbm_normalize_path_sep(root_path);
 
     if (!validate_search_args(root_path, file_pattern)) {
         free(root_path);
@@ -2940,6 +3291,18 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("path or file_pattern contains invalid characters", true);
     }
 
+    /* No grep-level match limit — let grep find all matches, then dedup and
+     * cap in our code. The -m flag caused results from large vendored files
+     * to exhaust the quota before reaching project source files. */
+    enum { GREP_MAX_MATCHES = 500 };
+    int grep_limit = GREP_MAX_MATCHES;
+
+    int gm_count = 0;
+    grep_match_t *gm = NULL;
+#ifdef _WIN32
+    gm = collect_windows_matches(srv, project, root_path, pattern, use_regex, file_pattern,
+                                 has_path_filter, &path_regex, grep_limit, &gm_count);
+#else
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
     char tmpfile[CBM_SZ_256];
     if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
@@ -2949,12 +3312,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern);
         return cbm_mcp_text_result("search failed: temp file", true);
     }
-
-    /* No grep-level match limit — let grep find all matches, then dedup and
-     * cap in our code. The -m flag caused results from large vendored files
-     * to exhaust the quota before reaching project source files. */
-    enum { GREP_MAX_MATCHES = 500 };
-    int grep_limit = GREP_MAX_MATCHES;
 
     /* Scope grep to indexed files only — avoids scanning vendored/generated code.
      * Query the graph for distinct file paths, write them to a temp file,
@@ -2983,14 +3340,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Collect grep matches into array */
-    int gm_count = 0;
-    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
-                                            &path_regex, grep_limit, &gm_count);
+    gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
+                              grep_limit, &gm_count);
     cbm_pclose(fp);
     cbm_unlink(tmpfile);
     if (scoped) {
         cbm_unlink(filelist);
     }
+#endif
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
     /* Sort grep matches by file for contiguous processing.
@@ -3007,7 +3364,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
 
     /* Sort matches by file path for contiguous per-file processing */
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    if (gm_count > SKIP_ONE) {
+        qsort(gm, gm_count, sizeof(grep_match_t), grep_match_cmp);
+    }
 
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
                            &raw_cap);
