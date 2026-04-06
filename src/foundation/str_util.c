@@ -267,6 +267,18 @@ bool cbm_validate_shell_arg(const char *s) {
     return true;
 }
 
+bool cbm_validate_path_arg(const char *s) {
+    if (!s) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < JSON_CTRL_LIMIT || *p == 0x7F) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int cbm_json_escape(char *buf, int bufsize, const char *src) {
     if (!buf || bufsize <= 0) {
         return 0;

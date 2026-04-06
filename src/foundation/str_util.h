@@ -53,6 +53,13 @@ char **cbm_str_split(CBMArena *a, const char *s, char delim, int *out_count);
  * Returns true if safe, false if the string contains shell metacharacters. */
 bool cbm_validate_shell_arg(const char *s);
 
+/* Validate a path-like string for direct filesystem / argv usage.
+ * This is NOT safe for shell interpolation.
+ * Rejects NULL and ASCII control characters, but allows printable characters
+ * such as spaces, quotes, ampersands, and dollar signs that can appear in
+ * valid Windows paths. */
+bool cbm_validate_path_arg(const char *s);
+
 /* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
  * When snprintf truncates, it returns what it WOULD have written, which can make
  * offset > bufsize. Next call: bufsize - offset wraps unsigned → huge → overflow.
