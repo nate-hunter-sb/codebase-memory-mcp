@@ -1,0 +1,116 @@
+/*
+ * test_temp_helpers.c - Focused regression coverage for temp-path helpers.
+ *
+ * This file is intentionally standalone so helper-layer changes can be
+ * validated without widening the main test runner surface.
+ */
+#include "test_framework.h"
+#include "test_helpers.h"
+
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
+
+#include <sys/stat.h>
+
+#ifdef _WIN32
+#include <io.h>
+#define cbm_close_fd _close
+#else
+#include <unistd.h>
+#define cbm_close_fd close
+#endif
+
+int tf_pass_count = 0;
+int tf_fail_count = 0;
+int tf_skip_count = 0;
+
+static int has_suffix(const char *s, const char *suffix) {
+    size_t s_len;
+    size_t suffix_len;
+
+    if (!s || !suffix) {
+        return 0;
+    }
+    s_len = strlen(s);
+    suffix_len = strlen(suffix);
+    if (suffix_len > s_len) {
+        return 0;
+    }
+    return strcmp(s + s_len - suffix_len, suffix) == 0;
+}
+
+TEST(temp_path_uses_process_tmpdir) {
+    char dir[CBM_PATH_MAX];
+    char path[CBM_PATH_MAX];
+
+    ASSERT_EQ(cbm_get_tmpdir(dir, sizeof(dir)), 0);
+    ASSERT_EQ(cbm_temp_path(path, sizeof(path), "cbm-helper.txt"), 0);
+    ASSERT_TRUE(strncmp(path, dir, strlen(dir)) == 0);
+    ASSERT_TRUE(has_suffix(path, "cbm-helper.txt"));
+    PASS();
+}
+
+TEST(temp_template_appends_suffix) {
+    char tmpl[CBM_PATH_MAX];
+
+    ASSERT_EQ(cbm_temp_template(tmpl, sizeof(tmpl), "cbm-template-"), 0);
+    ASSERT_TRUE(has_suffix(tmpl, "XXXXXX"));
+    ASSERT_TRUE(strstr(tmpl, "cbm-template-") != NULL);
+    PASS();
+}
+
+TEST(mkstemp_creates_file_from_helper_template) {
+    char tmpl[CBM_PATH_MAX];
+    struct stat st;
+    int fd;
+
+    ASSERT_EQ(cbm_temp_template(tmpl, sizeof(tmpl), "cbm-file-"), 0);
+    fd = cbm_mkstemp(tmpl);
+    ASSERT_GTE(fd, 0);
+    ASSERT_EQ(stat(tmpl, &st), 0);
+    ASSERT_FALSE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(cbm_close_fd(fd), 0);
+    ASSERT_EQ(cbm_unlink(tmpl), 0);
+    PASS();
+}
+
+TEST(mkdtemp_creates_dir_from_helper_template) {
+    char tmpl[CBM_PATH_MAX];
+    struct stat st;
+
+    ASSERT_EQ(cbm_temp_template(tmpl, sizeof(tmpl), "cbm-dir-"), 0);
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpl));
+    ASSERT_EQ(stat(tmpl, &st), 0);
+    ASSERT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(th_rmtree(tmpl), 0);
+    PASS();
+}
+
+TEST(legacy_tmp_template_still_works) {
+    char tmpl[CBM_PATH_MAX] = "/tmp/cbm-legacy-XXXXXX";
+    int fd = cbm_mkstemp(tmpl);
+
+    ASSERT_GTE(fd, 0);
+#ifdef _WIN32
+    ASSERT_TRUE(strncmp(tmpl, "/tmp/", CBM_SZ_5) != 0);
+#else
+    ASSERT_TRUE(strncmp(tmpl, "/tmp/", CBM_SZ_5) == 0);
+#endif
+    ASSERT_EQ(cbm_close_fd(fd), 0);
+    ASSERT_EQ(cbm_unlink(tmpl), 0);
+    PASS();
+}
+
+SUITE(temp_helpers) {
+    RUN_TEST(temp_path_uses_process_tmpdir);
+    RUN_TEST(temp_template_appends_suffix);
+    RUN_TEST(mkstemp_creates_file_from_helper_template);
+    RUN_TEST(mkdtemp_creates_dir_from_helper_template);
+    RUN_TEST(legacy_tmp_template_still_works);
+}
+
+int main(void) {
+    RUN_SUITE(temp_helpers);
+    TEST_SUMMARY();
+}

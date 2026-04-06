@@ -113,6 +113,15 @@ int cbm_mkstemp(char *tmpl);
 #define cbm_mkstemp mkstemp
 #endif
 
+/* Resolve the process temp directory into a caller-provided buffer. */
+int cbm_get_tmpdir(char *buf, size_t size);
+
+/* Build "<tmpdir>/<leaf>" in a caller-provided buffer. */
+int cbm_temp_path(char *buf, size_t size, const char *leaf);
+
+/* Build "<tmpdir>/<prefix>XXXXXX" for mkstemp/mkdtemp-style calls. */
+int cbm_temp_template(char *buf, size_t size, const char *prefix);
+
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */
 #ifdef _WIN32
 static inline int cbm_setenv(const char *name, const char *value, int overwrite) {
@@ -137,16 +146,7 @@ static inline int cbm_unsetenv(const char *name) {
 #endif
 
 /* ── Temp directory helper ───────────────────────────────────── */
-static inline const char *cbm_tmpdir(void) {
-#ifdef _WIN32
-    const char *t = getenv("TEMP");
-    if (!t)
-        t = getenv("TMP");
-    return t ? t : ".";
-#else
-    return "/tmp";
-#endif
-}
+const char *cbm_tmpdir(void);
 
 /* ── Signal handling ──────────────────────────────────────────── */
 /* Windows doesn't have sigaction; provide macro to select signal API. */
