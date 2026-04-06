@@ -304,9 +304,16 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `get_graph_schema` | Node/edge counts, relationship patterns. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
-| `search_code` | Grep-like text search within indexed project files. |
+| `search_code` | Grep-like text search within indexed project files. See `docs/WINDOWS_SEARCH.md` for the Windows fix contract and platform notes. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+
+### Windows `search_code`
+
+The repo is tracking a paired Windows `search_code` fix for the previous POSIX-only assumptions around `/tmp`, `grep`, and `xargs`.
+
+- The intended merged behavior is documented in [docs/WINDOWS_SEARCH.md](docs/WINDOWS_SEARCH.md).
+- That note also records the platform limitations that remain after the fix and the maintainer rules for temp files, path validation, and search execution.
 
 ## Graph Data Model
 
