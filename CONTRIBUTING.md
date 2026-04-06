@@ -149,6 +149,16 @@ If in doubt, open an issue and ask.
 - Run `scripts/test.sh` and `scripts/lint.sh` before submitting
 - Keep PRs focused — avoid unrelated reformatting or refactoring
 
+### Windows-safe search and temp files
+
+Changes that touch `search_code` or any other shell-backed search path must preserve native Windows behavior.
+
+- Do not hardcode `/tmp` or other POSIX-only temp paths. Use the platform temp helpers already provided by the codebase and delete temporary files on every exit path.
+- Treat `project`, resolved root paths, and `file_pattern` as shell-facing input. Validate them before execution instead of interpolating unchecked values into command strings.
+- Keep Windows execution native. Do not introduce new mandatory dependencies on GNU `grep`, `xargs`, MSYS2, Git Bash, or Cygwin just to make search work.
+- Preserve the current search contract: scope to indexed files when possible, then fall back to a recursive project-root search when scoped execution is unavailable.
+- If you change the search backend, update [docs/WINDOWS_SEARCH.md](docs/WINDOWS_SEARCH.md) in the same PR so user-visible behavior and maintainer expectations stay aligned.
+
 ## Security
 
 We take security seriously. All PRs go through:
