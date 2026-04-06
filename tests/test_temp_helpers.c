@@ -1,8 +1,5 @@
 /*
  * test_temp_helpers.c - Focused regression coverage for temp-path helpers.
- *
- * This file is intentionally standalone so helper-layer changes can be
- * validated without widening the main test runner surface.
  */
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -20,10 +17,6 @@
 #include <unistd.h>
 #define cbm_close_fd close
 #endif
-
-int tf_pass_count = 0;
-int tf_fail_count = 0;
-int tf_skip_count = 0;
 
 static int has_suffix(const char *s, const char *suffix) {
     size_t s_len;
@@ -108,9 +101,4 @@ SUITE(temp_helpers) {
     RUN_TEST(mkstemp_creates_file_from_helper_template);
     RUN_TEST(mkdtemp_creates_dir_from_helper_template);
     RUN_TEST(legacy_tmp_template_still_works);
-}
-
-int main(void) {
-    RUN_SUITE(temp_helpers);
-    TEST_SUMMARY();
 }
