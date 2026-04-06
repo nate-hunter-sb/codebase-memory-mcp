@@ -3197,8 +3197,13 @@ static int parse_search_mode(const char *mode_str) {
 /* Validate shell-safe arguments for search. */
 static bool validate_search_args(const char *root_path, const char *file_pattern) {
 #ifdef _WIN32
-    (void)file_pattern;
-    return root_path && root_path[0];
+    if (!cbm_validate_path_arg(root_path)) {
+        return false;
+    }
+    if (file_pattern && !cbm_validate_path_arg(file_pattern)) {
+        return false;
+    }
+    return true;
 #else
     if (!cbm_validate_shell_arg(root_path)) {
         return false;
