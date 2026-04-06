@@ -20,6 +20,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 CLI_STDERR=$(mktemp)
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
+tool_text() { python3 -c "import json,sys; raw=json.load(sys.stdin); content=raw.get('content') or []; print(content[0].get('text','') if content else '')"; }
 
 echo "=== Phase 1: version ==="
 OUTPUT=$("$BINARY" --version 2>&1)
@@ -454,6 +455,48 @@ rm -rf "$REPLACE_DIR"
 echo ""
 echo "=== Phase 7: MCP advanced tool calls ==="
 
+make_search_smoke_repo() {
+  local root="$1"
+  mkdir -p "$root/src/nested" "$root/web"
+
+  cat > "$root/src/alpha.py" << 'PYEOF'
+from src.nested.beta import alpha_handler
+
+SAFE_PATH_TOKEN = "SAFE_PATH_TOKEN"
+AMPERSAND_TOKEN = "AMPERSAND_TOKEN"
+TEMPFILE_TOKEN = "TEMPFILE_TOKEN"
+
+def context_target():
+    before_line = "BEFORE_CONTEXT"
+    marker = "CONTEXT_HIT"
+    after_line = "AFTER_CONTEXT"
+    return marker
+
+def caller():
+    return alpha_handler(42)
+PYEOF
+
+  cat > "$root/src/nested/beta.py" << 'PYEOF'
+FILE_PATTERN_TOKEN = "FILTER_SCOPE_TOKEN"
+PATH_FILTER_TOKEN = "PATH_FILTER_TOKEN"
+
+def alpha_handler(value):
+    return value + 1
+
+def beta_handler(value):
+    return value * 2
+PYEOF
+
+  cat > "$root/web/app.js" << 'JSEOF'
+const FILE_PATTERN_TOKEN = "FILTER_SCOPE_TOKEN";
+const PATH_FILTER_TOKEN = "PATH_FILTER_TOKEN";
+
+function renderWidget() {
+  return FILE_PATTERN_TOKEN;
+}
+JSEOF
+}
+
 # 7a: search_code via MCP (graph-augmented v2)
 echo "--- Phase 7a: search_code via MCP ---"
 MCP_SC_INPUT=$(mktemp)
@@ -480,6 +523,90 @@ if ! grep -q '"id":4' "$MCP_SC_OUTPUT"; then
   exit 1
 fi
 echo "OK: get_code_snippet via MCP"
+
+echo "--- Phase 7c: search_code shapes + Windows paths ---"
+SEARCH_SAFE_REPO="$TMPDIR/safe-name-repo"
+SEARCH_AMP_REPO="$TMPDIR/repo&path"
+make_search_smoke_repo "$SEARCH_SAFE_REPO"
+make_search_smoke_repo "$SEARCH_AMP_REPO"
+
+SEARCH_SAFE_INDEX=$(cli index_repository "{\"repo_path\":\"$SEARCH_SAFE_REPO\",\"mode\":\"fast\"}")
+SEARCH_SAFE_PROJECT=$(echo "$SEARCH_SAFE_INDEX" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('project',''))" 2>/dev/null || echo "")
+if [ -z "$SEARCH_SAFE_PROJECT" ]; then
+  echo "FAIL: safe-name repo did not return a project name"
+  exit 1
+fi
+
+SC_COMPACT=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"alpha_handler\",\"mode\":\"compact\",\"limit\":3}")
+if ! echo "$SC_COMPACT" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d.get('results', [])) > 0; assert 'source' not in d['results'][0]" 2>/dev/null; then
+  echo "FAIL: compact search_code shape regression"
+  exit 1
+fi
+
+SC_FULL=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"beta_handler\",\"mode\":\"full\",\"limit\":3}")
+if ! echo "$SC_FULL" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d.get('results', [])) > 0; assert 'source' in d['results'][0]" 2>/dev/null; then
+  echo "FAIL: full search_code shape regression"
+  exit 1
+fi
+
+SC_FILES=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"PATH_FILTER_TOKEN\",\"mode\":\"files\",\"limit\":10}")
+if ! echo "$SC_FILES" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d.get('files', [])) > 0; assert 'results' not in d" 2>/dev/null; then
+  echo "FAIL: files-mode search_code shape regression"
+  exit 1
+fi
+
+SC_FILE_PATTERN=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"FILTER_SCOPE_TOKEN\",\"file_pattern\":\"*.py\",\"limit\":10}")
+if ! echo "$SC_FILE_PATTERN" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); files=[item['file'] for item in d.get('results', [])]; assert files; assert all(not f.endswith('.js') for f in files)" 2>/dev/null; then
+  echo "FAIL: file_pattern regression"
+  exit 1
+fi
+
+SC_PATH_FILTER=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"PATH_FILTER_TOKEN\",\"path_filter\":\"^src/\",\"limit\":10}")
+if ! echo "$SC_PATH_FILTER" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); files=[item['file'] for item in d.get('results', [])]; assert files; assert all(f.startswith('src/') for f in files)" 2>/dev/null; then
+  echo "FAIL: path_filter regression"
+  exit 1
+fi
+
+SC_REGEX=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"def\\\\s+\\\\w+_handler\",\"regex\":true,\"limit\":10}")
+if ! echo "$SC_REGEX" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d.get('results', [])) > 0" 2>/dev/null; then
+  echo "FAIL: regex regression"
+  exit 1
+fi
+
+SC_LIMIT=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"def \",\"file_pattern\":\"*.py\",\"limit\":1}")
+if ! echo "$SC_LIMIT" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d.get('results', [])) == 1; assert d.get('total_results', 0) > 1" 2>/dev/null; then
+  echo "FAIL: limit regression"
+  exit 1
+fi
+
+SC_CONTEXT=$(cli search_code "{\"project\":\"$SEARCH_SAFE_PROJECT\",\"pattern\":\"CONTEXT_HIT\",\"context\":1,\"limit\":3}")
+if ! echo "$SC_CONTEXT" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); item=d['results'][0]; assert 'context' in item and 'context_start' in item; assert 'BEFORE_CONTEXT' in item['context']; assert 'AFTER_CONTEXT' in item['context']" 2>/dev/null; then
+  echo "FAIL: context regression"
+  exit 1
+fi
+echo "OK: search_code shapes and filters"
+
+SEARCH_AMP_INDEX=$(cli index_repository "{\"repo_path\":\"$SEARCH_AMP_REPO\",\"mode\":\"fast\"}")
+SEARCH_AMP_PROJECT=$(echo "$SEARCH_AMP_INDEX" | tool_text | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('project',''))" 2>/dev/null || echo "")
+if [ -z "$SEARCH_AMP_PROJECT" ]; then
+  echo "FAIL: ampersand repo did not return a project name"
+  exit 1
+fi
+
+SC_AMP=$(cli search_code "{\"project\":\"$SEARCH_AMP_PROJECT\",\"pattern\":\"caller\",\"mode\":\"compact\",\"limit\":3}")
+SC_AMP_TEXT=$(echo "$SC_AMP" | tool_text)
+if echo "$SC_AMP_TEXT" | grep -q 'invalid characters\|search failed: temp file\|"isError":true'; then
+  echo "FAIL: ampersand repo search_code regression"
+  exit 1
+fi
+if ! echo "$SC_AMP_TEXT" | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d.get('results', [])) > 0" 2>/dev/null; then
+  echo "FAIL: ampersand repo search_code returned no results"
+  exit 1
+fi
+echo "OK: ampersand-path search_code"
+
+cli delete_project "{\"project\":\"$SEARCH_SAFE_PROJECT\"}" > /dev/null || true
+cli delete_project "{\"project\":\"$SEARCH_AMP_PROJECT\"}" > /dev/null || true
 
 rm -f "$MCP_SC_INPUT" "$MCP_SC_OUTPUT"
 

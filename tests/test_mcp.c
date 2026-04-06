@@ -5,7 +5,9 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
@@ -982,6 +984,158 @@ static char *extract_text_content(const char *mcp_result) {
     return result;
 }
 
+typedef struct {
+    cbm_mcp_server_t *srv;
+    char repo_path[512];
+    char project[512];
+} search_code_fixture_t;
+
+static void normalize_test_path(char *path) {
+    for (char *p = path; p && *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+}
+
+static char *call_tool_text(cbm_mcp_server_t *srv, const char *tool, const char *args_json) {
+    char *raw = cbm_mcp_handle_tool(srv, tool, args_json);
+    char *text = extract_text_content(raw);
+    free(raw);
+    return text;
+}
+
+static void cleanup_search_code_fixture(search_code_fixture_t *fx) {
+    if (fx->srv) {
+        cbm_mcp_server_free(fx->srv);
+        fx->srv = NULL;
+    }
+    if (fx->repo_path[0]) {
+        th_cleanup(fx->repo_path);
+    }
+}
+
+static int setup_search_code_fixture(search_code_fixture_t *fx, const char *prefix) {
+    memset(fx, 0, sizeof(*fx));
+
+    char *tmp = th_mktempdir(prefix);
+    if (!tmp) {
+        return -1;
+    }
+    snprintf(fx->repo_path, sizeof(fx->repo_path), "%s", tmp);
+    normalize_test_path(fx->repo_path);
+
+    if (th_write_file(TH_PATH(fx->repo_path, "src/alpha.py"),
+                      "from src.nested.beta import alpha_handler\n"
+                      "\n"
+                      "SAFE_PATH_TOKEN = \"SAFE_PATH_TOKEN\"\n"
+                      "AMPERSAND_TOKEN = \"AMPERSAND_TOKEN\"\n"
+                      "TEMPFILE_TOKEN = \"TEMPFILE_TOKEN\"\n"
+                      "\n"
+                      "class SafeFixture:\n"
+                      "    pass\n"
+                      "\n"
+                      "def context_target():\n"
+                      "    before_line = \"BEFORE_CONTEXT\"\n"
+                      "    marker = \"CONTEXT_HIT\"\n"
+                      "    after_line = \"AFTER_CONTEXT\"\n"
+                      "    return marker\n"
+                      "\n"
+                      "def caller():\n"
+                      "    return alpha_handler(42)\n") != 0 ||
+        th_write_file(TH_PATH(fx->repo_path, "src/nested/beta.py"),
+                      "FILE_PATTERN_TOKEN = \"FILTER_SCOPE_TOKEN\"\n"
+                      "PATH_FILTER_TOKEN = \"PATH_FILTER_TOKEN\"\n"
+                      "\n"
+                      "def alpha_handler(value):\n"
+                      "    return value + 1\n"
+                      "\n"
+                      "def beta_handler(value):\n"
+                      "    return value * 2\n") != 0 ||
+        th_write_file(TH_PATH(fx->repo_path, "web/app.js"),
+                      "const FILE_PATTERN_TOKEN = \"FILTER_SCOPE_TOKEN\";\n"
+                      "const PATH_FILTER_TOKEN = \"PATH_FILTER_TOKEN\";\n"
+                      "\n"
+                      "function renderWidget() {\n"
+                      "  return FILE_PATTERN_TOKEN;\n"
+                      "}\n") != 0) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
+
+    fx->srv = cbm_mcp_server_new(NULL);
+    if (!fx->srv) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
+
+    char *project = cbm_project_name_from_path(fx->repo_path);
+    if (!project) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
+    snprintf(fx->project, sizeof(fx->project), "%s", project);
+    free(project);
+
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", fx->repo_path);
+    char *text = call_tool_text(fx->srv, "index_repository", args);
+    if (!text) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
+    int ok = strstr(text, "\"status\":\"indexed\"") != NULL;
+    free(text);
+    if (!ok) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int json_array_size(yyjson_val *root, const char *key) {
+    yyjson_val *arr = yyjson_obj_get(root, key);
+    if (!arr || !yyjson_is_arr(arr)) {
+        return -1;
+    }
+    return (int)yyjson_arr_size(arr);
+}
+
+static int all_result_files_have_prefix(yyjson_val *root, const char *prefix) {
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    if (!results || !yyjson_is_arr(results)) {
+        return 0;
+    }
+
+    size_t idx, max;
+    yyjson_val *item;
+    yyjson_arr_foreach(results, idx, max, item) {
+        const char *file = yyjson_get_str(yyjson_obj_get(item, "file"));
+        if (!file || strncmp(file, prefix, strlen(prefix)) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int any_result_file_contains(yyjson_val *root, const char *needle) {
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    if (!results || !yyjson_is_arr(results)) {
+        return 0;
+    }
+
+    size_t idx, max;
+    yyjson_val *item;
+    yyjson_arr_foreach(results, idx, max, item) {
+        const char *file = yyjson_get_str(yyjson_obj_get(item, "file"));
+        if (file && strstr(file, needle) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Call get_code_snippet and extract inner text content.
  * Caller must free returned string. */
 static char *call_snippet(cbm_mcp_server_t *srv, const char *args_json) {
@@ -989,6 +1143,216 @@ static char *call_snippet(cbm_mcp_server_t *srv, const char *args_json) {
     char *text = extract_text_content(raw);
     free(raw);
     return text;
+}
+
+TEST(tool_search_code_windows_safe_name_repo_path) {
+    search_code_fixture_t fx;
+    ASSERT_EQ(setup_search_code_fixture(&fx, "safe-name-repo"), 0);
+    ASSERT_NOT_NULL(strstr(fx.project, "safe-name-repo"));
+
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"caller\",\"mode\":\"compact\",\"limit\":3}",
+             fx.project);
+    char *text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NULL(strstr(text, "\"isError\":true"));
+    ASSERT_NULL(strstr(text, "invalid characters"));
+    ASSERT_NULL(strstr(text, "search failed: temp file"));
+
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_GT(json_array_size(root, "results"), 0);
+    ASSERT_TRUE(any_result_file_contains(root, "src/alpha.py"));
+
+    yyjson_doc_free(doc);
+    free(text);
+    cleanup_search_code_fixture(&fx);
+    PASS();
+}
+
+TEST(tool_search_code_windows_ampersand_repo_path) {
+    search_code_fixture_t fx;
+    ASSERT_EQ(setup_search_code_fixture(&fx, "repo&path"), 0);
+    ASSERT_NOT_NULL(strchr(fx.repo_path, '&'));
+
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"caller\",\"mode\":\"compact\",\"limit\":3}",
+             fx.project);
+    char *text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NULL(strstr(text, "\"isError\":true"));
+    ASSERT_NULL(strstr(text, "invalid characters"));
+    ASSERT_NULL(strstr(text, "search failed: temp file"));
+
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_GT(json_array_size(root, "results"), 0);
+    ASSERT_TRUE(any_result_file_contains(root, "src/alpha.py"));
+
+    yyjson_doc_free(doc);
+    free(text);
+    cleanup_search_code_fixture(&fx);
+    PASS();
+}
+
+TEST(tool_search_code_windows_temp_file_regression) {
+    search_code_fixture_t fx;
+    ASSERT_EQ(setup_search_code_fixture(&fx, "tempfile-regression"), 0);
+
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"context_target\",\"mode\":\"compact\",\"limit\":3}",
+             fx.project);
+    char *text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NULL(strstr(text, "\"isError\":true"));
+    ASSERT_NULL(strstr(text, "search failed: temp file"));
+
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_GT(json_array_size(root, "results"), 0);
+
+    yyjson_doc_free(doc);
+    free(text);
+    cleanup_search_code_fixture(&fx);
+    PASS();
+}
+
+TEST(tool_search_code_fixture_modes_filters_and_context) {
+    search_code_fixture_t fx;
+    ASSERT_EQ(setup_search_code_fixture(&fx, "fixture-shapes"), 0);
+
+    char args[512];
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"alpha_handler\",\"mode\":\"compact\",\"limit\":3}",
+             fx.project);
+    char *compact_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(compact_text);
+    yyjson_doc *compact_doc = yyjson_read(compact_text, strlen(compact_text), 0);
+    ASSERT_NOT_NULL(compact_doc);
+    yyjson_val *compact_root = yyjson_doc_get_root(compact_doc);
+    ASSERT_GT(json_array_size(compact_root, "results"), 0);
+    ASSERT_NOT_NULL(yyjson_obj_get(compact_root, "raw_matches"));
+    ASSERT_NULL(strstr(compact_text, "\"source\""));
+    yyjson_doc_free(compact_doc);
+    free(compact_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"beta_handler\",\"mode\":\"full\",\"limit\":3}",
+             fx.project);
+    char *full_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(full_text);
+    yyjson_doc *full_doc = yyjson_read(full_text, strlen(full_text), 0);
+    ASSERT_NOT_NULL(full_doc);
+    yyjson_val *full_root = yyjson_doc_get_root(full_doc);
+    yyjson_val *full_results = yyjson_obj_get(full_root, "results");
+    ASSERT_GT(json_array_size(full_root, "results"), 0);
+    yyjson_val *full_item = yyjson_arr_get(full_results, 0);
+    ASSERT_NOT_NULL(yyjson_obj_get(full_item, "source"));
+    yyjson_doc_free(full_doc);
+    free(full_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"PATH_FILTER_TOKEN\",\"mode\":\"files\",\"limit\":10}",
+             fx.project);
+    char *files_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(files_text);
+    yyjson_doc *files_doc = yyjson_read(files_text, strlen(files_text), 0);
+    ASSERT_NOT_NULL(files_doc);
+    yyjson_val *files_root = yyjson_doc_get_root(files_doc);
+    ASSERT_GT(json_array_size(files_root, "files"), 0);
+    ASSERT_NULL(yyjson_obj_get(files_root, "results"));
+    yyjson_doc_free(files_doc);
+    free(files_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"FILTER_SCOPE_TOKEN\",\"file_pattern\":\"*.py\",\"limit\":10}",
+             fx.project);
+    char *file_pattern_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(file_pattern_text);
+    yyjson_doc *file_pattern_doc = yyjson_read(file_pattern_text, strlen(file_pattern_text), 0);
+    ASSERT_NOT_NULL(file_pattern_doc);
+    yyjson_val *file_pattern_root = yyjson_doc_get_root(file_pattern_doc);
+    ASSERT_GT(json_array_size(file_pattern_root, "results"), 0);
+    ASSERT_FALSE(any_result_file_contains(file_pattern_root, "web/app.js"));
+    yyjson_doc_free(file_pattern_doc);
+    free(file_pattern_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"PATH_FILTER_TOKEN\",\"path_filter\":\"^src/nested/\",\"limit\":10}",
+             fx.project);
+    char *path_filter_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(path_filter_text);
+    yyjson_doc *path_filter_doc = yyjson_read(path_filter_text, strlen(path_filter_text), 0);
+    ASSERT_NOT_NULL(path_filter_doc);
+    yyjson_val *path_filter_root = yyjson_doc_get_root(path_filter_doc);
+    ASSERT_GT(json_array_size(path_filter_root, "results"), 0);
+    ASSERT_TRUE(all_result_files_have_prefix(path_filter_root, "src/nested/"));
+    yyjson_doc_free(path_filter_doc);
+    free(path_filter_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"def\\\\s+\\\\w+_handler\",\"regex\":true,\"limit\":10}",
+             fx.project);
+    char *regex_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(regex_text);
+    yyjson_doc *regex_doc = yyjson_read(regex_text, strlen(regex_text), 0);
+    ASSERT_NOT_NULL(regex_doc);
+    yyjson_val *regex_root = yyjson_doc_get_root(regex_doc);
+    ASSERT_GT(json_array_size(regex_root, "results"), 0);
+    yyjson_doc_free(regex_doc);
+    free(regex_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"def\\\\s+\\\\w+_handler\",\"regex\":false,\"limit\":10}",
+             fx.project);
+    char *literal_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(literal_text);
+    yyjson_doc *literal_doc = yyjson_read(literal_text, strlen(literal_text), 0);
+    ASSERT_NOT_NULL(literal_doc);
+    yyjson_val *literal_root = yyjson_doc_get_root(literal_doc);
+    ASSERT_EQ(json_array_size(literal_root, "results"), 0);
+    yyjson_doc_free(literal_doc);
+    free(literal_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"def \",\"file_pattern\":\"*.py\",\"limit\":1}", fx.project);
+    char *limit_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(limit_text);
+    yyjson_doc *limit_doc = yyjson_read(limit_text, strlen(limit_text), 0);
+    ASSERT_NOT_NULL(limit_doc);
+    yyjson_val *limit_root = yyjson_doc_get_root(limit_doc);
+    ASSERT_EQ(json_array_size(limit_root, "results"), 1);
+    ASSERT_GT((int)yyjson_get_int(yyjson_obj_get(limit_root, "total_results")), 1);
+    yyjson_doc_free(limit_doc);
+    free(limit_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"CONTEXT_HIT\",\"context\":1,\"limit\":3}", fx.project);
+    char *context_text = call_tool_text(fx.srv, "search_code", args);
+    ASSERT_NOT_NULL(context_text);
+    yyjson_doc *context_doc = yyjson_read(context_text, strlen(context_text), 0);
+    ASSERT_NOT_NULL(context_doc);
+    yyjson_val *context_root = yyjson_doc_get_root(context_doc);
+    yyjson_val *context_results = yyjson_obj_get(context_root, "results");
+    ASSERT_GT(json_array_size(context_root, "results"), 0);
+    yyjson_val *context_item = yyjson_arr_get(context_results, 0);
+    const char *context = yyjson_get_str(yyjson_obj_get(context_item, "context"));
+    ASSERT_NOT_NULL(context);
+    ASSERT_NOT_NULL(strstr(context, "BEFORE_CONTEXT"));
+    ASSERT_NOT_NULL(strstr(context, "AFTER_CONTEXT"));
+    ASSERT_NOT_NULL(yyjson_obj_get(context_item, "context_start"));
+    yyjson_doc_free(context_doc);
+    free(context_text);
+
+    cleanup_search_code_fixture(&fx);
+    PASS();
 }
 
 /* ── TestSnippet_ExactQN ──────────────────────────────────────── */
@@ -1711,6 +2075,10 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_not_found);
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
+    RUN_TEST(tool_search_code_windows_safe_name_repo_path);
+    RUN_TEST(tool_search_code_windows_ampersand_repo_path);
+    RUN_TEST(tool_search_code_windows_temp_file_regression);
+    RUN_TEST(tool_search_code_fixture_modes_filters_and_context);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
