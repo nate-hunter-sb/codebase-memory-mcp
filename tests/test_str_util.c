@@ -424,6 +424,42 @@ TEST(validate_shell_arg_spaces) {
     PASS();
 }
 
+TEST(validate_path_arg_null) {
+    ASSERT_FALSE(cbm_validate_path_arg(NULL));
+    PASS();
+}
+
+TEST(validate_path_arg_windows_metacharacters) {
+    ASSERT_TRUE(cbm_validate_path_arg("C:\\Users\\O'Connor & Sons\\$Recycle.Bin\\Project Files"));
+    PASS();
+}
+
+TEST(validate_path_arg_posix_shell_metacharacters) {
+    ASSERT_TRUE(cbm_validate_path_arg("/tmp/O'Connor & Sons/$cache/project"));
+    PASS();
+}
+
+TEST(validate_path_arg_newline) {
+    ASSERT_FALSE(cbm_validate_path_arg("line1\nline2"));
+    PASS();
+}
+
+TEST(validate_path_arg_tab) {
+    ASSERT_FALSE(cbm_validate_path_arg("tab\tpath"));
+    PASS();
+}
+
+TEST(validate_path_arg_delete_char) {
+    const char bad[] = {'b', 'a', 'd', 0x7F, 'p', 'a', 't', 'h', '\0'};
+    ASSERT_FALSE(cbm_validate_path_arg(bad));
+    PASS();
+}
+
+TEST(validate_path_arg_empty) {
+    ASSERT_TRUE(cbm_validate_path_arg(""));
+    PASS();
+}
+
 /* ── SNPRINTF_APPEND tests ────────────────────────────────────── */
 
 TEST(snprintf_append_basic) {
@@ -533,6 +569,13 @@ SUITE(str_util) {
     RUN_TEST(validate_shell_arg_backslash);
     RUN_TEST(validate_shell_arg_empty);
     RUN_TEST(validate_shell_arg_spaces);
+    RUN_TEST(validate_path_arg_null);
+    RUN_TEST(validate_path_arg_windows_metacharacters);
+    RUN_TEST(validate_path_arg_posix_shell_metacharacters);
+    RUN_TEST(validate_path_arg_newline);
+    RUN_TEST(validate_path_arg_tab);
+    RUN_TEST(validate_path_arg_delete_char);
+    RUN_TEST(validate_path_arg_empty);
     /* SNPRINTF_APPEND */
     RUN_TEST(snprintf_append_basic);
     RUN_TEST(snprintf_append_fills_exactly);

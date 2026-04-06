@@ -112,6 +112,18 @@ TEST(shell_rejects_env_var_expansion) {
     PASS();
 }
 
+TEST(path_validator_accepts_windows_path_shell_rejects) {
+    const char *path = "C:\\Users\\O'Connor & Sons\\$Recycle.Bin\\Codebase";
+    ASSERT_TRUE(cbm_validate_path_arg(path));
+    ASSERT_FALSE(cbm_validate_shell_arg(path));
+    PASS();
+}
+
+TEST(path_validator_rejects_control_characters) {
+    ASSERT_FALSE(cbm_validate_path_arg("C:\\temp\\bad\npath"));
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SQLITE AUTHORIZER (ATTACH/DETACH BLOCKED)
  * ══════════════════════════════════════════════════════════════════ */
@@ -371,6 +383,8 @@ SUITE(security) {
     RUN_TEST(shell_rejects_quote_escape_attack);
     RUN_TEST(shell_rejects_command_substitution);
     RUN_TEST(shell_rejects_env_var_expansion);
+    RUN_TEST(path_validator_accepts_windows_path_shell_rejects);
+    RUN_TEST(path_validator_rejects_control_characters);
 
     /* SQLite authorizer */
     RUN_TEST(sqlite_blocks_attach_via_cypher);
