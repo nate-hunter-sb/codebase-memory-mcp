@@ -185,6 +185,15 @@ static int response_array_size(const char *resp, const char *key) {
     return n;
 }
 
+static bool edge_targets_node(const cbm_edge_t *edges, int count, int64_t target_id) {
+    for (int i = 0; i < count; i++) {
+        if (edges[i].target_id == target_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ── Direct store queries (more reliable than MCP for tests) ────── */
 
 static cbm_store_t *open_store(void) {
@@ -246,22 +255,45 @@ static int incremental_setup(void) {
 
     /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
      * Cuts indexing time roughly in half on slow shared runners. */
-    char cmd[1024];
+    int rc = 0;
     if (getenv("CI")) {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
-                 g_repodir, g_repodir);
+        const char *clone_args[] = {"clone",
+                                    "--depth=1",
+                                    "--branch",
+                                    "0.99.1",
+                                    "--quiet",
+                                    "--filter=blob:none",
+                                    "--sparse",
+                                    "https://github.com/fastapi/fastapi.git",
+                                    g_repodir,
+                                    NULL};
+        const char *sparse_args[] = {"sparse-checkout", "set", "--no-cone", "/*", "!/docs",
+                                     "!/tests",         NULL};
+        rc = th_git_run(NULL, clone_args);
+        if (rc == 0) {
+            rc = th_git_run(g_repodir, sparse_args);
+        }
     } else {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet "
-                 "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 g_repodir);
+        const char *clone_args[] = {"clone", "--depth=1", "--branch", "0.99.1", "--quiet",
+                                    "https://github.com/fastapi/fastapi.git", g_repodir, NULL};
+        rc = th_git_run(NULL, clone_args);
     }
-    int rc = system(cmd);
     if (rc != 0) {
         printf("  clone failed (rc=%d) — network offline?\n", rc);
+        return -1;
+    }
+
+    if (th_write_file(TH_PATH(g_repodir, "incr_channel_fixture.js"),
+                      "const bus = require('events');\n"
+                      "bus.emit('top-level-incr');\n\n"
+                      "function incr_channel_helper() {\n"
+                      "  return 1;\n"
+                      "}\n\n"
+                      "function incr_channel_fixture() {\n"
+                      "  incr_channel_helper();\n"
+                      "  bus.emit('parallel\\\"channel\\\\name');\n"
+                      "  bus.on('parallel\\\"channel\\\\name', () => {});\n"
+                      "}\n") != 0) {
         return -1;
     }
 
@@ -381,6 +413,78 @@ TEST(incr_full_edge_types) {
     printf("    [edges] CALLS=%d IMPORTS=%d DEFINES=%d CONTAINS_FILE=%d\n", calls, imports, defines,
            contains);
 
+    PASS();
+}
+
+TEST(incr_full_channel_edges_attach_to_function) {
+    const char *channel_name = "parallel\\\"channel\\\\name";
+    cbm_store_t *s = open_store();
+    ASSERT_NOT_NULL(s);
+
+    cbm_node_t *channel_nodes = NULL;
+    int channel_count = 0;
+    cbm_store_find_nodes_by_name(s, g_project, channel_name, &channel_nodes, &channel_count);
+    ASSERT_GT(channel_count, 0);
+
+    yyjson_doc *props_doc =
+        yyjson_read(channel_nodes[0].properties_json, strlen(channel_nodes[0].properties_json), 0);
+    ASSERT_NOT_NULL(props_doc);
+    yyjson_val *props_root = yyjson_doc_get_root(props_doc);
+    yyjson_val *name_val = yyjson_obj_get(props_root, "name");
+    ASSERT_NOT_NULL(name_val);
+    ASSERT_EQ(strcmp(yyjson_get_str(name_val), channel_name), 0);
+    yyjson_doc_free(props_doc);
+
+    cbm_node_t func_node = {0};
+    cbm_node_t file_node = {0};
+    char *func_qn = cbm_pipeline_fqn_compute(g_project, "fastapi/incr_channel_fixture.js",
+                                             "incr_channel_fixture");
+    char *file_qn = cbm_pipeline_fqn_compute(g_project, "fastapi/incr_channel_fixture.js", "__file__");
+    if (cbm_store_find_node_by_qn(s, g_project, func_qn, &func_node) != CBM_STORE_OK) {
+        free(func_qn);
+        free(file_qn);
+        func_qn = cbm_pipeline_fqn_compute(g_project, "incr_channel_fixture.js",
+                                           "incr_channel_fixture");
+        file_qn = cbm_pipeline_fqn_compute(g_project, "incr_channel_fixture.js", "__file__");
+        ASSERT_EQ(cbm_store_find_node_by_qn(s, g_project, func_qn, &func_node), CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_find_node_by_qn(s, g_project, file_qn, &file_node), CBM_STORE_OK);
+    } else {
+        ASSERT_EQ(cbm_store_find_node_by_qn(s, g_project, file_qn, &file_node), CBM_STORE_OK);
+    }
+
+    cbm_edge_t *emit_edges = NULL;
+    cbm_edge_t *listen_edges = NULL;
+    cbm_edge_t *file_emit_edges = NULL;
+    int emit_count = 0;
+    int listen_count = 0;
+    int file_emit_count = 0;
+    cbm_store_find_edges_by_source_type(s, func_node.id, "EMITS", &emit_edges, &emit_count);
+    cbm_store_find_edges_by_source_type(s, func_node.id, "LISTENS_ON", &listen_edges, &listen_count);
+    cbm_store_find_edges_by_source_type(s, file_node.id, "EMITS", &file_emit_edges, &file_emit_count);
+
+    ASSERT_TRUE(edge_targets_node(emit_edges, emit_count, channel_nodes[0].id));
+    ASSERT_TRUE(edge_targets_node(listen_edges, listen_count, channel_nodes[0].id));
+    ASSERT_FALSE(edge_targets_node(file_emit_edges, file_emit_count, channel_nodes[0].id));
+
+    cbm_node_t *top_level_channels = NULL;
+    int top_level_count = 0;
+    cbm_store_find_nodes_by_name(s, g_project, "top-level-incr", &top_level_channels, &top_level_count);
+    ASSERT_GT(top_level_count, 0);
+    ASSERT_TRUE(edge_targets_node(file_emit_edges, file_emit_count, top_level_channels[0].id));
+
+    cbm_store_free_nodes(top_level_channels, top_level_count);
+    if (emit_edges)
+        cbm_store_free_edges(emit_edges, emit_count);
+    if (listen_edges)
+        cbm_store_free_edges(listen_edges, listen_count);
+    if (file_emit_edges)
+        cbm_store_free_edges(file_emit_edges, file_emit_count);
+    cbm_store_free_nodes(channel_nodes, channel_count);
+    cbm_node_free_fields(&func_node);
+    cbm_node_free_fields(&file_node);
+    free(func_qn);
+    free(file_qn);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -1307,6 +1411,46 @@ TEST(tool_sg_combined_filters) {
                               g_project);
     TOOL_OK(r, ms);
     ASSERT(strstr(r, "results") != NULL);
+    free(r);
+    PASS();
+}
+
+TEST(tool_sg_query_combined_filters) {
+    double ms;
+    char *r = call_tool_timed(
+        "search_graph", &ms,
+        "{\"project\":\"%s\",\"query\":\"incr_channel_fixture\","
+        "\"label\":\"Function\","
+        "\"name_pattern\":\"incr_channel_fixture\","
+        "\"qn_pattern\":\".*incr_channel_fixture.*\","
+        "\"file_pattern\":\"*incr_channel_fixture.js\","
+        "\"limit\":5}",
+        g_project);
+    TOOL_OK(r, ms);
+    ASSERT_EQ(count_in_response(r, "total"), 1);
+    ASSERT_EQ(response_array_size(r, "results"), 1);
+    char *text = extract_text_content(r);
+    ASSERT_NOT_NULL(strstr(text, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(text, "\"rank\":"));
+    free(text);
+    free(r);
+    PASS();
+}
+
+TEST(tool_sg_query_relationship_filter) {
+    double ms;
+    char *r = call_tool_timed(
+        "search_graph", &ms,
+        "{\"project\":\"%s\",\"query\":\"incr_channel_fixture\","
+        "\"label\":\"Function\","
+        "\"relationship\":\"CALLS\","
+        "\"min_degree\":1,"
+        "\"file_pattern\":\"*incr_channel_fixture.js\","
+        "\"limit\":5}",
+        g_project);
+    TOOL_OK(r, ms);
+    ASSERT_EQ(count_in_response(r, "total"), 1);
+    ASSERT_EQ(response_array_size(r, "results"), 1);
     free(r);
     PASS();
 }
@@ -2899,6 +3043,7 @@ SUITE(incremental) {
     RUN_TEST(incr_full_index);
     RUN_TEST(incr_full_has_functions);
     RUN_TEST(incr_full_edge_types);
+    RUN_TEST(incr_full_channel_edges_attach_to_function);
 
     /* Inject test functions so tool tests (trace_path etc.) always have data,
      * even when perf phases are skipped on CI. Update baseline counts. */
@@ -2985,6 +3130,8 @@ SUITE(incremental) {
     RUN_TEST(tool_sg_relationship);
     RUN_TEST(tool_sg_qn_pattern);
     RUN_TEST(tool_sg_combined_filters);
+    RUN_TEST(tool_sg_query_combined_filters);
+    RUN_TEST(tool_sg_query_relationship_filter);
     RUN_TEST(tool_sg_project_only);
     RUN_TEST(tool_sg_invalid_project);
 

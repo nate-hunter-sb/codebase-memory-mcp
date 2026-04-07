@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#include <windows.h>
 #include <io.h>
 #define cbm_close_fd _close
 #else
@@ -95,10 +96,30 @@ TEST(legacy_tmp_template_still_works) {
     PASS();
 }
 
+TEST(mkdir_p_rejects_stale_last_error_success) {
+#ifdef _WIN32
+    char tmpdir[CBM_PATH_MAX];
+    char file_path[CBM_PATH_MAX];
+    char child_path[CBM_PATH_MAX];
+
+    ASSERT_EQ(cbm_temp_template(tmpdir, sizeof(tmpdir), "cbm-mkdir-"), 0);
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    snprintf(file_path, sizeof(file_path), "%s/existing.txt", tmpdir);
+    ASSERT_EQ(th_write_file(file_path, "x"), 0);
+    snprintf(child_path, sizeof(child_path), "%s/existing.txt/child", tmpdir);
+
+    SetLastError(ERROR_ALREADY_EXISTS);
+    ASSERT_FALSE(cbm_mkdir_p(child_path, 0755));
+    ASSERT_EQ(th_rmtree(tmpdir), 0);
+#endif
+    PASS();
+}
+
 SUITE(temp_helpers) {
     RUN_TEST(temp_path_uses_process_tmpdir);
     RUN_TEST(temp_template_appends_suffix);
     RUN_TEST(mkstemp_creates_file_from_helper_template);
     RUN_TEST(mkdtemp_creates_dir_from_helper_template);
     RUN_TEST(legacy_tmp_template_still_works);
+    RUN_TEST(mkdir_p_rejects_stale_last_error_success);
 }

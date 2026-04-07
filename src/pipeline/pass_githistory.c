@@ -218,18 +218,23 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     *out = NULL;
     *out_count = 0;
 
-    if (!cbm_validate_shell_arg(repo_path)) {
+    if (!cbm_validate_path_arg(repo_path)) {
         return CBM_NOT_FOUND;
     }
 
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git log --name-only --pretty=format:COMMIT:%%H "
-             "--since='1 year ago' --max-count=10000 2>/dev/null",
-             repo_path);
-
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+    const char *argv[] = {"git",
+                          "-C",
+                          repo_path,
+                          "log",
+                          "--name-only",
+                          "--pretty=format:COMMIT:%H",
+                          "--since=1 year ago",
+                          "--max-count=10000",
+                          NULL};
+    char *output = NULL;
+    int exit_code = 0;
+    if (cbm_exec_capture(argv, &output, &exit_code) != 0 || exit_code != 0) {
+        free(output);
         return CBM_NOT_FOUND;
     }
 
@@ -238,13 +243,20 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     int count = 0;
     commit_t current = {0};
 
-    char line[CBM_SZ_1K];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    for (char *line = output; line && *line;) {
+        char *next = strpbrk(line, "\r\n");
+        if (next) {
+            *next = '\0';
+            next++;
+            while (*next == '\r' || *next == '\n') {
+                next++;
+            }
+        } else {
+            next = line + strlen(line);
         }
+        size_t len = strlen(line);
         if (len == 0) {
+            line = next;
             continue;
         }
 
@@ -257,12 +269,14 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
                 commits[count++] = current;
                 memset(&current, 0, sizeof(current));
             }
+            line = next;
             continue;
         }
 
         if (cbm_is_trackable_file(line)) {
             commit_add_file(&current, line);
         }
+        line = next;
     }
     if (current.count > 0) {
         if (count >= cap) {
@@ -274,7 +288,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
         commit_free(&current);
     }
 
-    cbm_pclose(fp);
+    free(output);
     *out = commits;
     *out_count = count;
     return 0;
@@ -427,7 +441,12 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     commit_t *commits = NULL;
     int commit_count = 0;
     int rc = parse_git_log(repo_path, &commits, &commit_count);
-    if (rc != 0 || commit_count == 0) {
+    if (rc != 0) {
+        cbm_log_warn("githistory.skip", "reason", "git_log_failed", "path", repo_path);
+        free(commits);
+        return 0;
+    }
+    if (commit_count == 0) {
         free(commits);
         return 0;
     }
@@ -449,6 +468,15 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     }
 
     cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
+    if (!couplings) {
+        free(cf);
+        for (int c = 0; c < commit_count; c++) {
+            commit_free(&commits[c]);
+        }
+        free(commits);
+        cbm_log_warn("githistory.skip", "reason", "coupling_alloc_failed", "path", repo_path);
+        return 0;
+    }
     int coupling_count = cbm_compute_change_coupling(cf, commit_count, couplings, MAX_COUPLINGS);
 
     free(cf);

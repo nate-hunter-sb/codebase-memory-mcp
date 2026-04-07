@@ -56,4 +56,10 @@ int cbm_rmdir(const char *path);
  * POSIX: fork() + execvp(). Windows: _spawnvp(). */
 int cbm_exec_no_shell(const char *const *argv);
 
+/* Execute a command without shell interpretation and capture stdout.
+ * stderr is discarded. On success, returns 0, stores the child's exit
+ * code in exit_code (if non-NULL), and writes a heap-allocated stdout
+ * buffer to stdout_out (if non-NULL). Returns -1 on spawn/capture failure. */
+int cbm_exec_capture(const char *const *argv, char **stdout_out, int *exit_code);
+
 #endif /* CBM_COMPAT_FS_H */

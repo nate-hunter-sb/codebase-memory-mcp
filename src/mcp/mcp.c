@@ -277,8 +277,9 @@ static const tool_def_t TOOLS[] = {
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
      "indexed as individual words (updateCloudClient → update, cloud, client). Results are "
      "ranked with structural boosting: Functions/Methods +10, Routes +8, Classes/Interfaces +5. "
-     "Noise labels (File/Folder/Module/Variable) are filtered out. When provided, name_pattern "
-     "is ignored.\"},"
+      "Noise labels (File/Folder/Module/Variable) are filtered out. When provided, structural "
+      "filters such as label, name_pattern, qn_pattern, file_pattern, relationship, and degree "
+      "still narrow the BM25 result set.\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
@@ -1051,6 +1052,9 @@ enum {
     BM25_SEP_RESERVE = 1,
     BM25_QUERY_BUF = 1024,
     BM25_DEFAULT_LIMIT = 100,
+    BM25_SQL_BUF = 8192,
+    BM25_WHERE_BUF = 4096,
+    BM25_MAX_BINDS = 24,
     BM25_COL_ID = 0,
     BM25_COL_LABEL = 1,
     BM25_COL_NAME = 2,
@@ -1059,10 +1063,9 @@ enum {
     BM25_COL_START = 5,
     BM25_COL_END = 6,
     BM25_COL_RANK = 7,
+    BM25_COL_IN_DEG = 8,
+    BM25_COL_OUT_DEG = 9,
     BM25_BIND_QUERY = 1,
-    BM25_BIND_PROJECT = 2,
-    BM25_BIND_LIMIT = 3,
-    BM25_BIND_OFFSET = 4,
     BM25_SQL_AUTO_LEN = -1,
 };
 
@@ -1116,10 +1119,146 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
 }
 
 /* Run the BM25 full-text search path and return the JSON result string.
- * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
- * in which case the caller falls back to the regex-based search path. */
-static char *bm25_search(cbm_store_t *store, const char *project, const char *query, int limit,
-                         int offset) {
+ * Returns NULL only if FTS5 is unavailable, in which case the caller falls
+ * back to the structured search path. Empty/unsanitizable queries return a
+ * valid empty BM25 response so the request does not broaden unexpectedly. */
+typedef struct {
+    const char *text;
+} bm25_bind_t;
+
+static int bm25_where_append(char *where, int where_sz, int wlen, int *nclauses, const char *cond) {
+    if (*nclauses > 0) {
+        wlen += snprintf(where + wlen, where_sz - wlen, " AND ");
+    }
+    wlen += snprintf(where + wlen, where_sz - wlen, "%s", cond);
+    (*nclauses)++;
+    return wlen;
+}
+
+static void bm25_bind_text(bm25_bind_t *binds, int *bind_count, const char *value) {
+    binds[*bind_count].text = value;
+    (*bind_count)++;
+}
+
+static void bm25_add_regex(char *where, int where_sz, int *wlen, int *nclauses,
+                           bm25_bind_t *binds, int *bind_count, int *next_param,
+                           const char *column, const char *pattern) {
+    char clause[CBM_SZ_128];
+    snprintf(clause, sizeof(clause), "iregexp(?%d, %s)", *next_param, column);
+    *wlen = bm25_where_append(where, where_sz, *wlen, nclauses, clause);
+    bm25_bind_text(binds, bind_count, pattern);
+    (*next_param)++;
+}
+
+static void bm25_add_exclude_labels(char *where, int where_sz, int *wlen, int *nclauses,
+                                    bm25_bind_t *binds, int *bind_count, int *next_param) {
+    static const char *excluded_labels[] = {"File", "Folder", "Module",   "Section",
+                                            "Variable", "Project", NULL};
+    char clause[CBM_SZ_512];
+    int clen = snprintf(clause, sizeof(clause), "n.label NOT IN (");
+    for (int i = 0; excluded_labels[i]; i++) {
+        if (i > 0 && clen < (int)sizeof(clause)) {
+            clen += snprintf(clause + clen, sizeof(clause) - (size_t)clen, ",");
+        }
+        if (clen < (int)sizeof(clause)) {
+            clen += snprintf(clause + clen, sizeof(clause) - (size_t)clen, "?%d", *next_param);
+        }
+        bm25_bind_text(binds, bind_count, excluded_labels[i]);
+        (*next_param)++;
+    }
+    if (clen < (int)sizeof(clause)) {
+        snprintf(clause + clen, sizeof(clause) - (size_t)clen, ")");
+    }
+    *wlen = bm25_where_append(where, where_sz, *wlen, nclauses, clause);
+}
+
+static int bm25_build_where(const cbm_search_params_t *params, char *where, int where_sz,
+                            bm25_bind_t *binds, int *bind_count, char **like_pattern_out) {
+    char clause[CBM_SZ_256];
+    int wlen = 0;
+    int nclauses = 0;
+    int next_param = 2;
+
+    *like_pattern_out = NULL;
+
+    if (params->project) {
+        snprintf(clause, sizeof(clause), "n.project = ?%d", next_param);
+        wlen = bm25_where_append(where, where_sz, wlen, &nclauses, clause);
+        bm25_bind_text(binds, bind_count, params->project);
+        next_param++;
+    }
+    if (params->label) {
+        snprintf(clause, sizeof(clause), "n.label = ?%d", next_param);
+        wlen = bm25_where_append(where, where_sz, wlen, &nclauses, clause);
+        bm25_bind_text(binds, bind_count, params->label);
+        next_param++;
+    }
+    if (params->name_pattern) {
+        bm25_add_regex(where, where_sz, &wlen, &nclauses, binds, bind_count, &next_param, "n.name",
+                       params->name_pattern);
+    }
+    if (params->qn_pattern) {
+        bm25_add_regex(where, where_sz, &wlen, &nclauses, binds, bind_count, &next_param,
+                       "n.qualified_name", params->qn_pattern);
+    }
+    if (params->file_pattern) {
+        *like_pattern_out = cbm_glob_to_like(params->file_pattern);
+        snprintf(clause, sizeof(clause), "n.file_path LIKE ?%d", next_param);
+        wlen = bm25_where_append(where, where_sz, wlen, &nclauses, clause);
+        bm25_bind_text(binds, bind_count, *like_pattern_out);
+        next_param++;
+    }
+    if (params->relationship) {
+        snprintf(clause, sizeof(clause),
+                 "EXISTS(SELECT 1 FROM edges e WHERE "
+                 "(e.source_id = n.id OR e.target_id = n.id) AND e.type = ?%d)",
+                 next_param);
+        wlen = bm25_where_append(where, where_sz, wlen, &nclauses, clause);
+        bm25_bind_text(binds, bind_count, params->relationship);
+        next_param++;
+    }
+    if (params->exclude_entry_points) {
+        wlen = bm25_where_append(
+            where, where_sz, wlen, &nclauses,
+            "NOT (NOT EXISTS(SELECT 1 FROM edges e WHERE e.target_id = n.id "
+            "AND e.type = 'CALLS') "
+            "AND EXISTS(SELECT 1 FROM edges e2 WHERE e2.source_id = n.id "
+            "AND e2.type = 'CALLS'))");
+    }
+    bm25_add_exclude_labels(where, where_sz, &wlen, &nclauses, binds, bind_count, &next_param);
+
+    return nclauses;
+}
+
+static void bm25_apply_degree_filter(char *sql, size_t sql_sz, const cbm_search_params_t *params) {
+    if (params->min_degree < 0 && params->max_degree < 0) {
+        return;
+    }
+
+    char inner_sql[BM25_SQL_BUF];
+    snprintf(inner_sql, sizeof(inner_sql), "%s", sql);
+    if (params->min_degree >= 0 && params->max_degree >= 0) {
+        snprintf(sql, sql_sz,
+                 "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d AND (in_deg + out_deg) <= %d",
+                 inner_sql, params->min_degree, params->max_degree);
+    } else if (params->min_degree >= 0) {
+        snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d", inner_sql,
+                 params->min_degree);
+    } else {
+        snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) <= %d", inner_sql,
+                 params->max_degree);
+    }
+}
+
+static void bm25_bind_params(sqlite3_stmt *stmt, const char *fts_query, const bm25_bind_t *binds,
+                             int bind_count) {
+    sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    for (int i = 0; i < bind_count; i++) {
+        sqlite3_bind_text(stmt, i + 2, binds[i].text, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    }
+}
+
+static char *bm25_search(cbm_store_t *store, const cbm_search_params_t *params, const char *query) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -1127,55 +1266,76 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     char fts_query[BM25_QUERY_BUF];
     int tok_count = bm25_build_match(query, fts_query, sizeof(fts_query));
     if (tok_count == 0) {
-        return NULL;
+        yyjson_mut_doc *empty_doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *empty_root = yyjson_mut_obj(empty_doc);
+        yyjson_mut_doc_set_root(empty_doc, empty_root);
+        yyjson_mut_obj_add_int(empty_doc, empty_root, "total", 0);
+        yyjson_mut_obj_add_str(empty_doc, empty_root, "search_mode", "bm25");
+        yyjson_mut_obj_add_val(empty_doc, empty_root, "results", yyjson_mut_arr(empty_doc));
+        yyjson_mut_obj_add_bool(empty_doc, empty_root, "has_more", false);
+        char *empty_json = yy_doc_to_str(empty_doc);
+        yyjson_mut_doc_free(empty_doc);
+        return empty_json;
     }
 
     /* BM25 ranked query with structural label boosting.  bm25() returns a
      * NEGATIVE score (lower = more relevant), so we subtract the boost to
      * make high-value labels sort first.  File/Folder/Module/Variable are
      * excluded entirely — agents rarely want those as discovery results. */
-    const char *sql =
+    const char *select_cols =
         "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
         "       (bm25(nodes_fts) "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
-        "               ELSE 0.0 END) AS rank "
-        "FROM nodes_fts "
-        "JOIN nodes n ON n.id = nodes_fts.rowid "
-        "WHERE nodes_fts MATCH ?1 "
-        "  AND n.project = ?2 "
-        "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
-        "ORDER BY rank "
-        "LIMIT ?3 OFFSET ?4";
+        "               ELSE 0.0 END) AS rank, "
+        "       (SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type = 'CALLS') "
+        "           AS in_deg, "
+        "       (SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND e.type = 'CALLS') "
+        "           AS out_deg ";
+
+    char sql[BM25_SQL_BUF];
+    char count_sql[BM25_SQL_BUF];
+    char where[BM25_WHERE_BUF] = "";
+    bm25_bind_t binds[BM25_MAX_BINDS];
+    int bind_count = 0;
+    char *like_pattern = NULL;
+    int nclauses =
+        bm25_build_where(params, where, (int)sizeof(where), binds, &bind_count, &like_pattern);
+    if (nclauses > 0) {
+        snprintf(sql, sizeof(sql),
+                 "%s FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid "
+                 "WHERE nodes_fts MATCH ?1 AND %s",
+                 select_cols, where);
+    } else {
+        snprintf(sql, sizeof(sql),
+                 "%s FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid WHERE nodes_fts MATCH ?1",
+                 select_cols);
+    }
+    bm25_apply_degree_filter(sql, sizeof(sql), params);
+    snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM (%s)", sql);
+
+    int limit = params->limit > 0 ? params->limit : BM25_DEFAULT_LIMIT;
+    int offset = params->offset > 0 ? params->offset : 0;
+    char order_limit[CBM_SZ_128];
+    snprintf(order_limit, sizeof(order_limit), " ORDER BY rank LIMIT %d OFFSET %d", limit, offset);
+    strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        free(like_pattern);
         return NULL;
     }
-    sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
-    sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
+    bm25_bind_params(stmt, fts_query, binds, bind_count);
 
-    /* Count total hits (for pagination) in a separate cheap query. */
     int total = 0;
-    {
-        const char *count_sql =
-            "SELECT COUNT(*) FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid "
-            "WHERE nodes_fts MATCH ?1 AND n.project = ?2 "
-            "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')";
-        sqlite3_stmt *cs = NULL;
-        if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            if (sqlite3_step(cs) == SQLITE_ROW) {
-                total = sqlite3_column_int(cs, 0);
-            }
-            sqlite3_finalize(cs);
+    sqlite3_stmt *count_stmt = NULL;
+    if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &count_stmt, NULL) == SQLITE_OK) {
+        bm25_bind_params(count_stmt, fts_query, binds, bind_count);
+        if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+            total = sqlite3_column_int(count_stmt, 0);
         }
+        sqlite3_finalize(count_stmt);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -1188,21 +1348,26 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     int emitted = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_strcpy(doc, item, "name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
-        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
-        yyjson_mut_obj_add_strcpy(doc, item, "label",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
-        yyjson_mut_obj_add_strcpy(doc, item, "file_path",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
+        const char *name = (const char *)sqlite3_column_text(stmt, BM25_COL_NAME);
+        const char *qn = (const char *)sqlite3_column_text(stmt, BM25_COL_QN);
+        const char *label = (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL);
+        const char *file_path = (const char *)sqlite3_column_text(stmt, BM25_COL_FILE);
+        int64_t node_id = sqlite3_column_int64(stmt, BM25_COL_ID);
+        yyjson_mut_obj_add_strcpy(doc, item, "name", name ? name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name", qn ? qn : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "label", label ? label : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file_path", file_path ? file_path : "");
         yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, BM25_COL_START));
         yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, BM25_COL_END));
         yyjson_mut_obj_add_real(doc, item, "rank", sqlite3_column_double(stmt, BM25_COL_RANK));
+        if (params->include_connected && node_id > 0) {
+            enrich_connected(doc, item, store, node_id, params->relationship);
+        }
         yyjson_mut_arr_add_val(results, item);
         emitted++;
     }
     sqlite3_finalize(stmt);
+    free(like_pattern);
 
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emitted);
@@ -1315,25 +1480,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
-    /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
-     * and return early.  The regex/vector path below is untouched for all
-     * other callers.  If FTS5 is unavailable or the query is empty after
-     * tokenization, fall through to the regex path. */
     char *query = cbm_mcp_get_string_arg(args, "query");
-    if (query && query[0]) {
-        int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
-        int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
-        char *bm25_json = bm25_search(store, project, query, q_limit, q_offset);
-        if (bm25_json) {
-            free(query);
-            free(project);
-            char *result = cbm_mcp_text_result(bm25_json, false);
-            free(bm25_json);
-            return result;
-        }
-    }
-    free(query);
-
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
@@ -1341,13 +1488,15 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     bool exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points");
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
-    int limit = cbm_mcp_get_int_arg(args, "limit", MCP_HALF_SEC_US);
+    int limit = cbm_mcp_get_int_arg(args, "limit",
+                                    (query && query[0]) ? BM25_DEFAULT_LIMIT : MCP_HALF_SEC_US);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
 
     if (relationship && !validate_edge_type(relationship)) {
         free(project);
+        free(query);
         free(label);
         free(name_pattern);
         free(qn_pattern);
@@ -1372,19 +1521,48 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     };
 
     cbm_search_output_t out = {0};
-    cbm_store_search(store, &params, &out);
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = NULL;
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
+    if (query && query[0]) {
+        char *bm25_json = bm25_search(store, &params, query);
+        if (bm25_json) {
+            yyjson_doc *bm25_doc = yyjson_read(bm25_json, strlen(bm25_json), 0);
+            if (bm25_doc) {
+                doc = yyjson_doc_mut_copy(bm25_doc, NULL);
+                yyjson_doc_free(bm25_doc);
+            }
+            if (!doc) {
+                free(project);
+                free(query);
+                free(label);
+                free(name_pattern);
+                free(qn_pattern);
+                free(file_pattern);
+                free(relationship);
+                char *result = cbm_mcp_text_result(bm25_json, false);
+                free(bm25_json);
+                return result;
+            }
+            root = yyjson_mut_doc_get_root(doc);
+            free(bm25_json);
+        }
+    }
+    if (!doc) {
+        cbm_store_search(store, &params, &out);
+        doc = yyjson_mut_doc_new(NULL);
+        root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        emit_search_results(doc, root, &out, store, relationship, include_connected, offset);
+    }
 
-    emit_search_results(doc, root, &out, store, relationship, include_connected, offset);
     bool sq_type_error = run_semantic_query(doc, root, args, store, project, limit);
 
     if (sq_type_error) {
         yyjson_mut_doc_free(doc);
         cbm_store_search_free(&out);
         free(project);
+        free(query);
         free(label);
         free(name_pattern);
         free(qn_pattern);
@@ -1403,6 +1581,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_search_free(&out);
 
     free(project);
+    free(query);
     free(label);
     free(name_pattern);
     free(qn_pattern);
@@ -3812,6 +3991,8 @@ static void *autoindex_thread(void *arg) {
 }
 
 /* Start auto-indexing if configured and project not yet indexed. */
+static int count_nonempty_lines(const char *text);
+
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
@@ -3854,26 +4035,27 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 
     /* Quick file count check to avoid OOM on massive repos */
-    if (!cbm_validate_shell_arg(srv->session_root)) {
-        cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
+    if (!cbm_validate_path_arg(srv->session_root)) {
+        cbm_log_warn("autoindex.skip", "reason", "path contains invalid characters");
         return;
     }
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (fp) {
-        char line[CBM_SZ_64];
-        if (fgets(line, sizeof(line), fp)) {
-            int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
-            if (count > file_limit) {
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line, "limit",
-                             CBM_CONFIG_AUTO_INDEX_LIMIT);
-                cbm_pclose(fp);
-                return;
-            }
+    const char *argv[] = {"git", "-C", srv->session_root, "ls-files", NULL};
+    char *output = NULL;
+    int exit_code = 0;
+    if (cbm_exec_capture(argv, &output, &exit_code) == 0 && exit_code == 0) {
+        int count = count_nonempty_lines(output);
+        if (count > file_limit) {
+            char count_buf[CBM_SZ_32];
+            char limit_buf[CBM_SZ_32];
+            snprintf(count_buf, sizeof(count_buf), "%d", count);
+            snprintf(limit_buf, sizeof(limit_buf), "%d", file_limit);
+            cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf,
+                         "limit", limit_buf);
+            free(output);
+            return;
         }
-        cbm_pclose(fp);
     }
+    free(output);
 
     /* Launch auto-index in background */
     if (cbm_thread_create(&srv->autoindex_tid, 0, autoindex_thread, srv) == 0) {
@@ -3882,6 +4064,28 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 }
 
 /* ── Background update check ──────────────────────────────────── */
+
+static int count_nonempty_lines(const char *text) {
+    if (!text || !text[0]) {
+        return 0;
+    }
+
+    int count = 0;
+    bool saw_char = false;
+    for (const char *p = text; *p; p++) {
+        if (*p != '\r' && *p != '\n') {
+            saw_char = true;
+        }
+        if (*p == '\n') {
+            count++;
+        }
+    }
+    size_t len = strlen(text);
+    if (saw_char && text[len - SKIP_ONE] != '\n') {
+        count++;
+    }
+    return count;
+}
 
 #define UPDATE_CHECK_URL "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
 

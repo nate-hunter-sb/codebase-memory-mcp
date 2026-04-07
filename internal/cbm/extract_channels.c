@@ -128,27 +128,18 @@ static const char *resolve_identifier(const chan_const_table_t *tbl, const char 
 
 /* ── Enclosing function detection ───────────────────────────────── */
 
-/* Walk up the parent chain to find the nearest function-like ancestor and
- * build a best-effort qualified name for it. */
+/* Resolve the nearest named function/method QN for channel attribution.
+ * Top-level and anonymous contexts intentionally return NULL so the pipeline
+ * keeps using the file node as the source fallback. */
 static const char *enclosing_function_qn(CBMExtractCtx *ctx, TSNode node) {
-    TSNode parent = ts_node_parent(node);
-    while (!ts_node_is_null(parent)) {
-        const char *pk = ts_node_type(parent);
-        if (strcmp(pk, "function_declaration") == 0 || strcmp(pk, "method_definition") == 0 ||
-            strcmp(pk, "arrow_function") == 0 || strcmp(pk, "function_expression") == 0 ||
-            strcmp(pk, "function") == 0 || strcmp(pk, "method_signature") == 0) {
-            TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-            if (!ts_node_is_null(name_node)) {
-                char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-                if (name && name[0]) {
-                    return name;
-                }
-            }
-            return NULL;
-        }
-        parent = ts_node_parent(parent);
+    const char *qn = cbm_enclosing_func_qn_cached(ctx, node);
+    if (!qn || !qn[0]) {
+        return NULL;
     }
-    return NULL;
+    if (ctx->module_qn && strcmp(qn, ctx->module_qn) == 0) {
+        return NULL;
+    }
+    return qn;
 }
 
 /* ── Emit / listen detection ────────────────────────────────────── */

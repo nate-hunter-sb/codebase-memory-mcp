@@ -21,8 +21,10 @@
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,112 +89,259 @@ int cbm_watcher_poll_interval_ms(int file_count) {
 
 /* ── Git helpers ────────────────────────────────────────────────── */
 
-static bool is_git_repo(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse --git-dir 2>/dev/null", root_path);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
+static int git_exec_capture(const char *const *argv, char **output) {
+    char *captured = NULL;
+    int exit_code = 0;
+    if (cbm_exec_capture(argv, output ? &captured : NULL, &exit_code) != 0) {
+        return CBM_NOT_FOUND;
     }
-    /* Drain output so pclose gets a clean exit status. */
-    char drain[CBM_SZ_128];
-    while (fgets(drain, (int)sizeof(drain), fp)) { /* discard */
+    if (exit_code != 0) {
+        free(captured);
+        return CBM_NOT_FOUND;
     }
-    int rc = cbm_pclose(fp);
-    return rc == 0;
+    if (output) {
+        *output = captured;
+    } else {
+        free(captured);
+    }
+    return 0;
 }
 
-static int git_head(const char *root_path, char *out, size_t out_size) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD 2>/dev/null", root_path);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+static int git_capture_first_line(const char *const *argv, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
         return CBM_NOT_FOUND;
     }
 
-    if (fgets(out, (int)out_size, fp)) {
-        size_t len = strlen(out);
-        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
-            out[--len] = '\0';
-        }
-        cbm_pclose(fp);
-        return 0;
+    char *output = NULL;
+    if (git_exec_capture(argv, &output) != 0) {
+        return CBM_NOT_FOUND;
     }
-    cbm_pclose(fp);
-    return CBM_NOT_FOUND;
+
+    char *line = output;
+    while (*line == '\r' || *line == '\n') {
+        line++;
+    }
+    if (*line == '\0') {
+        free(output);
+        return CBM_NOT_FOUND;
+    }
+
+    char *end = strpbrk(line, "\r\n");
+    if (end) {
+        *end = '\0';
+    }
+    snprintf(out, out_size, "%s", line);
+    free(output);
+    return 0;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' status --porcelain "
-             "--untracked-files=normal 2>/dev/null",
-             root_path);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+static bool git_output_has_content(const char *const *argv) {
+    char *output = NULL;
+    if (git_exec_capture(argv, &output) != 0) {
         return false;
     }
-
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-
-    if (dirty) {
-        return true;
-    }
-
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). */
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
-             "2>/dev/null",
-             root_path);
-    fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-    return dirty;
+    bool has_content = output[0] != '\0';
+    free(output);
+    return has_content;
 }
 
-/* Count tracked files via git ls-files */
-static int git_file_count(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", root_path);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+static int count_output_lines(const char *text) {
+    if (!text || !text[0]) {
         return 0;
     }
 
     int count = 0;
-    char line[CBM_SZ_64];
-    if (fgets(line, sizeof(line), fp)) {
-        count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
+    bool saw_char = false;
+    for (const char *p = text; *p; p++) {
+        if (*p != '\r' && *p != '\n') {
+            saw_char = true;
+        }
+        if (*p == '\n') {
+            count++;
+        }
     }
-    cbm_pclose(fp);
+    size_t len = strlen(text);
+    if (saw_char && text[len - SKIP_ONE] != '\n') {
+        count++;
+    }
+    return count;
+}
+
+static bool path_is_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+#ifdef _WIN32
+    if ((isalpha((unsigned char)path[0]) && path[1] == ':' &&
+         (path[2] == '/' || path[2] == '\\')) ||
+        path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+    return false;
+#else
+    return path[0] == '/';
+#endif
+}
+
+static void trim_trailing_sep(char *path) {
+    if (!path) {
+        return;
+    }
+    size_t len = strlen(path);
+    while (len > 1 && path[len - SKIP_ONE] == '/') {
+#ifdef _WIN32
+        if (len == 3 && path[1] == ':' && path[2] == '/') {
+            break;
+        }
+#endif
+        path[--len] = '\0';
+    }
+}
+
+static bool canonicalize_existing_dir(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0 || !cbm_is_dir(path)) {
+        return false;
+    }
+#ifdef _WIN32
+    if (!_fullpath(out, path, out_size)) {
+        return false;
+    }
+#else
+    if (!realpath(path, out)) {
+        return false;
+    }
+#endif
+    cbm_normalize_path_sep(out);
+#ifdef _WIN32
+    for (char *p = out; *p; p++) {
+        *p = (char)tolower((unsigned char)*p);
+    }
+#endif
+    trim_trailing_sep(out);
+    return true;
+}
+
+static bool resolve_submodule_path(const char *root_path, const char *raw_path, char *out,
+                                   size_t out_size) {
+    if (!root_path || !raw_path || !out || out_size == 0) {
+        return false;
+    }
+
+    while (*raw_path == ' ' || *raw_path == '\t') {
+        raw_path++;
+    }
+    if (!raw_path[0] || path_is_absolute(raw_path)) {
+        return false;
+    }
+
+    char joined[CBM_PATH_MAX];
+    if (snprintf(joined, sizeof(joined), "%s/%s", root_path, raw_path) >= (int)sizeof(joined)) {
+        return false;
+    }
+
+    char norm_root[CBM_PATH_MAX];
+    char norm_candidate[CBM_PATH_MAX];
+    if (!canonicalize_existing_dir(root_path, norm_root, sizeof(norm_root)) ||
+        !canonicalize_existing_dir(joined, norm_candidate, sizeof(norm_candidate))) {
+        return false;
+    }
+
+    size_t root_len = strlen(norm_root);
+    if (root_len == 0 || strcmp(norm_root, norm_candidate) == 0) {
+        return false;
+    }
+    if (strncmp(norm_candidate, norm_root, root_len) != 0 || norm_candidate[root_len] != '/') {
+        return false;
+    }
+
+    snprintf(out, out_size, "%s", norm_candidate);
+    return true;
+}
+
+static bool git_submodules_dirty_recursive(const char *root_path, int depth) {
+    if (depth > CBM_SZ_16) {
+        return false;
+    }
+
+    const char *argv[] = {"git", "-C", root_path, "config", "--file", ".gitmodules",
+                          "--get-regexp", "path", NULL};
+    char *output = NULL;
+    if (git_exec_capture(argv, &output) != 0) {
+        return false;
+    }
+
+    for (char *line = output; line && *line;) {
+        char *next = strpbrk(line, "\r\n");
+        if (next) {
+            *next = '\0';
+            next++;
+            while (*next == '\r' || *next == '\n') {
+                next++;
+            }
+        } else {
+            next = line + strlen(line);
+        }
+
+        char *value = strpbrk(line, " \t");
+        if (value) {
+            while (*value == ' ' || *value == '\t') {
+                value++;
+            }
+            if (*value) {
+                char submodule_path[CBM_PATH_MAX];
+                if (resolve_submodule_path(root_path, value, submodule_path,
+                                           sizeof(submodule_path))) {
+                    const char *status_argv[] = {"git",         "--no-optional-locks",
+                                                 "-C",          submodule_path,
+                                                 "status",      "--porcelain",
+                                                 "--untracked-files=normal", NULL};
+                    if (git_output_has_content(status_argv) ||
+                        git_submodules_dirty_recursive(submodule_path, depth + SKIP_ONE)) {
+                        free(output);
+                        return true;
+                    }
+                }
+            }
+        }
+        line = next;
+    }
+
+    free(output);
+    return false;
+}
+
+static bool is_git_repo(const char *root_path) {
+    const char *argv[] = {"git", "-C", root_path, "rev-parse", "--git-dir", NULL};
+    return git_exec_capture(argv, NULL) == 0;
+}
+
+static int git_head(const char *root_path, char *out, size_t out_size) {
+    const char *argv[] = {"git", "-C", root_path, "rev-parse", "HEAD", NULL};
+    return git_capture_first_line(argv, out, out_size);
+}
+
+/* Returns true if working tree has changes (modified, untracked, etc.).
+ * Also checks submodules by walking them directly to avoid shell nesting. */
+static bool git_is_dirty(const char *root_path) {
+    const char *status_argv[] = {"git",         "--no-optional-locks", "-C",
+                                 root_path,     "status",              "--porcelain",
+                                 "--untracked-files=normal",           NULL};
+    if (git_output_has_content(status_argv)) {
+        return true;
+    }
+    return git_submodules_dirty_recursive(root_path, 0);
+}
+
+/* Count tracked files via git ls-files */
+static int git_file_count(const char *root_path) {
+    const char *argv[] = {"git", "-C", root_path, "ls-files", NULL};
+    char *output = NULL;
+    if (git_exec_capture(argv, &output) != 0) {
+        return 0;
+    }
+
+    int count = count_output_lines(output);
+    free(output);
     return count;
 }
 
@@ -256,10 +405,10 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
-    /* Reject paths with shell metacharacters — all git helpers use popen/system */
-    if (!cbm_validate_shell_arg(root_path)) {
+    /* Reject control characters before passing paths to git argv helpers. */
+    if (!cbm_validate_path_arg(root_path)) {
         cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
-                     "path contains shell metacharacters");
+                     "path contains invalid characters");
         return;
     }
 

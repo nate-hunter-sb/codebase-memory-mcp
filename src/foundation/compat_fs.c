@@ -18,9 +18,11 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <errno.h>
 #include <windows.h>
 #include <direct.h> /* _mkdir */
 #include <io.h>     /* _unlink */
+#include <process.h>
 
 struct cbm_dir {
     HANDLE find_handle;
@@ -132,7 +134,8 @@ bool cbm_mkdir_p(const char *path, int mode) {
             *p = '\\';
         }
     }
-    bool ok = _mkdir(tmp) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+    int mkdir_rc = _mkdir(tmp);
+    bool ok = mkdir_rc == 0 || errno == EEXIST;
     free(tmp);
     return ok;
 }
@@ -152,12 +155,288 @@ int cbm_exec_no_shell(const char *const *argv) {
     return (int)_spawnvp(_P_WAIT, argv[0], argv);
 }
 
+static int append_bytes(char **buf, size_t *len, size_t *cap, const char *data, size_t data_len) {
+    if (!buf || !len || !cap) {
+        return CBM_NOT_FOUND;
+    }
+    if (data_len == 0) {
+        return 0;
+    }
+    size_t needed = *len + data_len + SKIP_ONE;
+    if (needed > *cap) {
+        size_t new_cap = *cap ? *cap : CBM_SZ_256;
+        while (new_cap < needed) {
+            new_cap *= PAIR_LEN;
+        }
+        char *tmp = realloc(*buf, new_cap);
+        if (!tmp) {
+            return CBM_NOT_FOUND;
+        }
+        *buf = tmp;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, data, data_len);
+    *len += data_len;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+static bool windows_arg_needs_quotes(const char *arg) {
+    if (!arg || !arg[0]) {
+        return true;
+    }
+    for (const char *p = arg; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '"') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t windows_quoted_arg_len(const char *arg) {
+    if (!arg) {
+        return 0;
+    }
+    if (!windows_arg_needs_quotes(arg)) {
+        return strlen(arg);
+    }
+
+    size_t len = PAIR_LEN; /* opening + closing quote */
+    int backslashes = 0;
+    for (const char *p = arg; *p; p++) {
+        if (*p == '\\') {
+            backslashes++;
+            continue;
+        }
+        if (*p == '"') {
+            len += (size_t)(backslashes * PAIR_LEN) + PAIR_LEN;
+            backslashes = 0;
+        } else {
+            len += (size_t)backslashes + SKIP_ONE;
+            backslashes = 0;
+        }
+    }
+    len += (size_t)(backslashes * PAIR_LEN);
+    return len;
+}
+
+static char *windows_write_quoted_arg(char *dst, const char *arg) {
+    if (!windows_arg_needs_quotes(arg)) {
+        size_t len = strlen(arg);
+        memcpy(dst, arg, len);
+        return dst + len;
+    }
+
+    *dst++ = '"';
+    int backslashes = 0;
+    for (const char *p = arg; *p; p++) {
+        if (*p == '\\') {
+            backslashes++;
+            continue;
+        }
+        if (*p == '"') {
+            for (int i = 0; i < backslashes * PAIR_LEN + SKIP_ONE; i++) {
+                *dst++ = '\\';
+            }
+            *dst++ = '"';
+            backslashes = 0;
+            continue;
+        }
+        while (backslashes-- > 0) {
+            *dst++ = '\\';
+        }
+        backslashes = 0;
+        *dst++ = *p;
+    }
+    while (backslashes-- > 0) {
+        *dst++ = '\\';
+        *dst++ = '\\';
+    }
+    *dst++ = '"';
+    return dst;
+}
+
+static char *build_windows_cmdline(const char *const *argv) {
+    if (!argv || !argv[0]) {
+        return NULL;
+    }
+
+    size_t total = SKIP_ONE;
+    int argc = 0;
+    while (argv[argc]) {
+        total += windows_quoted_arg_len(argv[argc]) + SKIP_ONE;
+        argc++;
+    }
+
+    char *cmdline = malloc(total);
+    if (!cmdline) {
+        return NULL;
+    }
+
+    char *dst = cmdline;
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) {
+            *dst++ = ' ';
+        }
+        dst = windows_write_quoted_arg(dst, argv[i]);
+    }
+    *dst = '\0';
+    return cmdline;
+}
+
+static int read_windows_handle(HANDLE handle, char **stdout_out) {
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    char chunk[CBM_SZ_4K];
+    DWORD got = 0;
+
+    for (;;) {
+        if (!ReadFile(handle, chunk, sizeof(chunk), &got, NULL)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_BROKEN_PIPE) {
+                break;
+            }
+            free(buf);
+            return CBM_NOT_FOUND;
+        }
+        if (got == 0) {
+            break;
+        }
+        if (stdout_out && append_bytes(&buf, &len, &cap, chunk, (size_t)got) != 0) {
+            free(buf);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (stdout_out) {
+        if (!buf) {
+            buf = malloc(SKIP_ONE);
+            if (!buf) {
+                return CBM_NOT_FOUND;
+            }
+            buf[0] = '\0';
+        }
+        *stdout_out = buf;
+    }
+    return 0;
+}
+
+int cbm_exec_capture(const char *const *argv, char **stdout_out, int *exit_code) {
+    if (stdout_out) {
+        *stdout_out = NULL;
+    }
+    if (exit_code) {
+        *exit_code = CBM_NOT_FOUND;
+    }
+    if (!argv || !argv[0]) {
+        return CBM_NOT_FOUND;
+    }
+
+    char *cmdline = build_windows_cmdline(argv);
+    if (!cmdline) {
+        return CBM_NOT_FOUND;
+    }
+
+    SECURITY_ATTRIBUTES sa = {0};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE read_pipe = NULL;
+    HANDLE write_pipe = NULL;
+    HANDLE null_input = INVALID_HANDLE_VALUE;
+    HANDLE null_output = INVALID_HANDLE_VALUE;
+    PROCESS_INFORMATION pi = {0};
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+
+    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
+        free(cmdline);
+        return CBM_NOT_FOUND;
+    }
+    if (!SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        free(cmdline);
+        return CBM_NOT_FOUND;
+    }
+
+    null_input = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    null_output = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (null_input == INVALID_HANDLE_VALUE || null_output == INVALID_HANDLE_VALUE) {
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        if (null_input != INVALID_HANDLE_VALUE) {
+            CloseHandle(null_input);
+        }
+        if (null_output != INVALID_HANDLE_VALUE) {
+            CloseHandle(null_output);
+        }
+        free(cmdline);
+        return CBM_NOT_FOUND;
+    }
+
+    si.hStdInput = null_input;
+    si.hStdOutput = write_pipe;
+    si.hStdError = null_output;
+
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si,
+                        &pi)) {
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        CloseHandle(null_input);
+        CloseHandle(null_output);
+        free(cmdline);
+        return CBM_NOT_FOUND;
+    }
+
+    CloseHandle(write_pipe);
+    write_pipe = NULL;
+    CloseHandle(null_input);
+    CloseHandle(null_output);
+    null_input = INVALID_HANDLE_VALUE;
+    null_output = INVALID_HANDLE_VALUE;
+    free(cmdline);
+
+    char *captured = NULL;
+    int read_rc = read_windows_handle(read_pipe, stdout_out ? &captured : NULL);
+    CloseHandle(read_pipe);
+    read_pipe = NULL;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD child_exit = 0;
+    if (!GetExitCodeProcess(pi.hProcess, &child_exit)) {
+        child_exit = (DWORD)CBM_NOT_FOUND;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (read_rc != 0) {
+        free(captured);
+        return CBM_NOT_FOUND;
+    }
+
+    if (stdout_out) {
+        *stdout_out = captured;
+    }
+    if (exit_code) {
+        *exit_code = (int)child_exit;
+    }
+    return 0;
+}
+
 #else /* POSIX */
 
 /* ── POSIX implementation ─────────────────────────────────────── */
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -280,6 +559,136 @@ int cbm_exec_no_shell(const char *const *argv) {
         return WEXITSTATUS(status);
     }
     return CBM_NOT_FOUND; /* killed by signal */
+}
+
+static int append_bytes(char **buf, size_t *len, size_t *cap, const char *data, size_t data_len) {
+    if (!buf || !len || !cap) {
+        return CBM_NOT_FOUND;
+    }
+    if (data_len == 0) {
+        return 0;
+    }
+    size_t needed = *len + data_len + SKIP_ONE;
+    if (needed > *cap) {
+        size_t new_cap = *cap ? *cap : CBM_SZ_256;
+        while (new_cap < needed) {
+            new_cap *= PAIR_LEN;
+        }
+        char *tmp = realloc(*buf, new_cap);
+        if (!tmp) {
+            return CBM_NOT_FOUND;
+        }
+        *buf = tmp;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, data, data_len);
+    *len += data_len;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+static int read_posix_fd(int fd, char **stdout_out) {
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    char chunk[CBM_SZ_4K];
+
+    for (;;) {
+        ssize_t got = read(fd, chunk, sizeof(chunk));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(buf);
+            return CBM_NOT_FOUND;
+        }
+        if (got == 0) {
+            break;
+        }
+        if (stdout_out && append_bytes(&buf, &len, &cap, chunk, (size_t)got) != 0) {
+            free(buf);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (stdout_out) {
+        if (!buf) {
+            buf = malloc(SKIP_ONE);
+            if (!buf) {
+                return CBM_NOT_FOUND;
+            }
+            buf[0] = '\0';
+        }
+        *stdout_out = buf;
+    }
+    return 0;
+}
+
+int cbm_exec_capture(const char *const *argv, char **stdout_out, int *exit_code) {
+    if (stdout_out) {
+        *stdout_out = NULL;
+    }
+    if (exit_code) {
+        *exit_code = CBM_NOT_FOUND;
+    }
+    if (!argv || !argv[0]) {
+        return CBM_NOT_FOUND;
+    }
+
+    int pipefd[PAIR_LEN] = {CBM_NOT_FOUND, CBM_NOT_FOUND};
+    if (cbm_pipe(pipefd) != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return CBM_NOT_FOUND;
+    }
+
+    if (pid == 0) {
+        int null_fd = open("/dev/null", O_WRONLY);
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDERR_FILENO);
+            close(null_fd);
+        }
+        close(pipefd[1]);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    int read_rc = read_posix_fd(pipefd[0], stdout_out);
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            if (stdout_out && *stdout_out) {
+                free(*stdout_out);
+                *stdout_out = NULL;
+            }
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (read_rc != 0) {
+        if (stdout_out && *stdout_out) {
+            free(*stdout_out);
+            *stdout_out = NULL;
+        }
+        return CBM_NOT_FOUND;
+    }
+
+    if (exit_code) {
+        *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 #endif /* _WIN32 */

@@ -88,6 +88,81 @@ static inline int th_mkdir_p(const char *path) {
 /* ── Recursive directory removal ──────────────────────────────── */
 
 /* Remove a file or directory tree recursively. Cross-platform rm -rf. */
+static inline size_t th_argv_len(const char *const *argv) {
+    size_t len = 0;
+    if (!argv) {
+        return 0;
+    }
+    while (argv[len]) {
+        len++;
+    }
+    return len;
+}
+
+static inline const char **th_git_argv(const char *repo_path, const char *const *args) {
+    size_t arg_count = th_argv_len(args);
+    size_t prefix_count = repo_path ? 3 : 1;
+    const char **argv = malloc((arg_count + prefix_count + 1) * sizeof(char *));
+    if (!argv) {
+        return NULL;
+    }
+
+    size_t idx = 0;
+    argv[idx++] = "git";
+    if (repo_path) {
+        argv[idx++] = "-C";
+        argv[idx++] = repo_path;
+    }
+    for (size_t i = 0; i < arg_count; i++) {
+        argv[idx++] = args[i];
+    }
+    argv[idx] = NULL;
+    return argv;
+}
+
+static inline int th_git_run(const char *repo_path, const char *const *args) {
+    const char **argv = th_git_argv(repo_path, args);
+    if (!argv) {
+        return -1;
+    }
+    int rc = cbm_exec_no_shell(argv);
+    free((void *)argv);
+    return rc;
+}
+
+static inline int th_git_capture(const char *repo_path, const char *const *args, char **stdout_out,
+                                 int *exit_code) {
+    const char **argv = th_git_argv(repo_path, args);
+    if (!argv) {
+        return -1;
+    }
+    int rc = cbm_exec_capture(argv, stdout_out, exit_code);
+    free((void *)argv);
+    return rc;
+}
+
+static inline int th_git_init_repo(const char *repo_path) {
+    const char *init_args[] = {"init", "-q", NULL};
+    const char *email_args[] = {"config", "user.email", "test@test", NULL};
+    const char *name_args[] = {"config", "user.name", "test", NULL};
+    if (th_git_run(repo_path, init_args) != 0) {
+        return -1;
+    }
+    if (th_git_run(repo_path, email_args) != 0) {
+        return -1;
+    }
+    return th_git_run(repo_path, name_args);
+}
+
+static inline int th_git_commit_all(const char *repo_path, const char *message) {
+    const char *add_args[] = {"add", "-A", NULL};
+    const char *commit_args[] = {"commit", "-q", "-m", message, NULL};
+    if (th_git_run(repo_path, add_args) != 0) {
+        return -1;
+    }
+    return th_git_run(repo_path, commit_args);
+}
+
 static inline int th_rmtree(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {

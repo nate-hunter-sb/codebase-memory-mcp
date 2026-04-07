@@ -1135,6 +1135,15 @@ static void teardown_lang_repo(void) {
     g_lang_tmpdir[0] = '\0';
 }
 
+static bool edge_targets_node(const cbm_edge_t *edges, int count, int64_t target_id) {
+    for (int i = 0; i < count; i++) {
+        if (edges[i].target_id == target_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -1232,6 +1241,89 @@ TEST(pipeline_go_cross_package_call) {
         cbm_store_free_edges(edges, ec);
     cbm_store_free_nodes(targets, tc);
     cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_js_channel_edges_attach_to_functions) {
+    const char *channel_name = "alert\\\"name\\\\slash";
+    const char *files[] = {"events.js"};
+    const char *contents[] = {
+        "const bus = require('events');\n"
+        "bus.emit('top-level');\n\n"
+        "function wireUp() {\n"
+        "  bus.emit('alert\\\"name\\\\slash');\n"
+        "  bus.on('alert\\\"name\\\\slash', () => {});\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        SKIP("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *channel_nodes = NULL;
+    int channel_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, channel_name, &channel_nodes, &channel_count);
+    ASSERT_GT(channel_count, 0);
+
+    yyjson_doc *props_doc =
+        yyjson_read(channel_nodes[0].properties_json, strlen(channel_nodes[0].properties_json), 0);
+    ASSERT_NOT_NULL(props_doc);
+    yyjson_val *props_root = yyjson_doc_get_root(props_doc);
+    yyjson_val *name_val = yyjson_obj_get(props_root, "name");
+    ASSERT_NOT_NULL(name_val);
+    ASSERT_EQ(strcmp(yyjson_get_str(name_val), channel_name), 0);
+    yyjson_doc_free(props_doc);
+
+    char *func_qn = cbm_pipeline_fqn_compute(proj, "events.js", "wireUp");
+    char *file_qn = cbm_pipeline_fqn_compute(proj, "events.js", "__file__");
+    cbm_node_t func_node = {0};
+    cbm_node_t file_node = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, func_qn, &func_node), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, file_qn, &file_node), CBM_STORE_OK);
+
+    cbm_edge_t *emit_edges = NULL;
+    cbm_edge_t *listen_edges = NULL;
+    cbm_edge_t *file_emit_edges = NULL;
+    int emit_count = 0;
+    int listen_count = 0;
+    int file_emit_count = 0;
+    cbm_store_find_edges_by_source_type(s, func_node.id, "EMITS", &emit_edges, &emit_count);
+    cbm_store_find_edges_by_source_type(s, func_node.id, "LISTENS_ON", &listen_edges, &listen_count);
+    cbm_store_find_edges_by_source_type(s, file_node.id, "EMITS", &file_emit_edges, &file_emit_count);
+
+    ASSERT_TRUE(edge_targets_node(emit_edges, emit_count, channel_nodes[0].id));
+    ASSERT_TRUE(edge_targets_node(listen_edges, listen_count, channel_nodes[0].id));
+    ASSERT_FALSE(edge_targets_node(file_emit_edges, file_emit_count, channel_nodes[0].id));
+
+    cbm_node_t *top_level_channels = NULL;
+    int top_level_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "top-level", &top_level_channels, &top_level_count);
+    ASSERT_GT(top_level_count, 0);
+    ASSERT_TRUE(edge_targets_node(file_emit_edges, file_emit_count, top_level_channels[0].id));
+
+    cbm_store_free_nodes(top_level_channels, top_level_count);
+    if (emit_edges)
+        cbm_store_free_edges(emit_edges, emit_count);
+    if (listen_edges)
+        cbm_store_free_edges(listen_edges, listen_count);
+    if (file_emit_edges)
+        cbm_store_free_edges(file_emit_edges, file_emit_count);
+    cbm_store_free_nodes(channel_nodes, channel_count);
+    cbm_node_free_fields(&func_node);
+    cbm_node_free_fields(&file_node);
+    free(func_qn);
+    free(file_qn);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
@@ -4096,6 +4188,54 @@ TEST(envscan_non_url_values_skipped) {
 
 /* ── Git history tests (port of githistory_test.go) ────────────── */
 
+static int setup_githistory_repo_fixture(char *repo_path, size_t repo_path_size,
+                                         const char *template_path) {
+    snprintf(repo_path, repo_path_size, "%s", template_path);
+    if (!cbm_mkdtemp(repo_path)) {
+        return -1;
+    }
+
+    if (th_git_init_repo(repo_path) != 0) {
+        th_rmtree(repo_path);
+        return -2;
+    }
+
+    const struct {
+        const char *a_content;
+        const char *b_content;
+        const char *message;
+    } commits[] = {{"package main\n\nvar A = 1\n", "package main\n\nvar B = 1\n", "init"},
+                   {"package main\n\nvar A = 2\n", "package main\n\nvar B = 2\n", "update-one"},
+                   {"package main\n\nvar A = 3\n", "package main\n\nvar B = 3\n",
+                    "update-two"}};
+
+    char a_path[1024];
+    char b_path[1024];
+    snprintf(a_path, sizeof(a_path), "%s/a.go", repo_path);
+    snprintf(b_path, sizeof(b_path), "%s/b.go", repo_path);
+
+    for (size_t i = 0; i < sizeof(commits) / sizeof(commits[0]); i++) {
+        if (th_write_file(a_path, commits[i].a_content) != 0 ||
+            th_write_file(b_path, commits[i].b_content) != 0 ||
+            th_git_commit_all(repo_path, commits[i].message) != 0) {
+            th_rmtree(repo_path);
+            return -3;
+        }
+    }
+
+    return 0;
+}
+
+static void free_githistory_result(cbm_githistory_result_t *result) {
+    if (!result) {
+        return;
+    }
+    free(result->couplings);
+    result->couplings = NULL;
+    result->count = 0;
+    result->commit_count = 0;
+}
+
 /* Port of Go TestIsTrackableFile from githistory_test.go */
 TEST(githistory_is_trackable_file) {
     /* Source files — trackable */
@@ -4210,6 +4350,80 @@ TEST(githistory_coupling_limits_output) {
     cbm_change_coupling_t out[200];
     int count = cbm_compute_change_coupling(commits, ci, out, 100);
     ASSERT(count <= 100);
+    PASS();
+}
+
+TEST(githistory_compute_repo_path_with_spaces) {
+#ifdef HAVE_LIBGIT2
+    SKIP("fallback-only test when libgit2 is enabled");
+#endif
+    char tmpdir[256];
+    int setup_rc =
+        setup_githistory_repo_fixture(tmpdir, sizeof(tmpdir), "/tmp/cbm githistory space_XXXXXX");
+    if (setup_rc == -1) {
+        SKIP("cbm_mkdtemp failed");
+    }
+    if (setup_rc == -2) {
+        SKIP("git not available");
+    }
+    ASSERT_EQ(setup_rc, 0);
+
+    cbm_githistory_result_t result = {0};
+    ASSERT_EQ(cbm_pipeline_githistory_compute(tmpdir, &result), 0);
+    ASSERT_EQ(result.commit_count, 3);
+    ASSERT_GTE(result.count, 1);
+
+    bool found_pair = false;
+    for (int i = 0; i < result.count; i++) {
+        if ((strcmp(result.couplings[i].file_a, "a.go") == 0 &&
+             strcmp(result.couplings[i].file_b, "b.go") == 0) ||
+            (strcmp(result.couplings[i].file_a, "b.go") == 0 &&
+             strcmp(result.couplings[i].file_b, "a.go") == 0)) {
+            found_pair = true;
+            ASSERT_GTE(result.couplings[i].co_change_count, 3);
+        }
+    }
+    ASSERT_TRUE(found_pair);
+
+    free_githistory_result(&result);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(githistory_compute_repo_path_with_ampersand) {
+#ifdef HAVE_LIBGIT2
+    SKIP("fallback-only test when libgit2 is enabled");
+#endif
+    char tmpdir[256];
+    int setup_rc =
+        setup_githistory_repo_fixture(tmpdir, sizeof(tmpdir), "/tmp/cbm_githistory_&_XXXXXX");
+    if (setup_rc == -1) {
+        SKIP("cbm_mkdtemp failed");
+    }
+    if (setup_rc == -2) {
+        SKIP("git not available");
+    }
+    ASSERT_EQ(setup_rc, 0);
+
+    cbm_githistory_result_t result = {0};
+    ASSERT_EQ(cbm_pipeline_githistory_compute(tmpdir, &result), 0);
+    ASSERT_EQ(result.commit_count, 3);
+    ASSERT_GTE(result.count, 1);
+
+    bool found_pair = false;
+    for (int i = 0; i < result.count; i++) {
+        if ((strcmp(result.couplings[i].file_a, "a.go") == 0 &&
+             strcmp(result.couplings[i].file_b, "b.go") == 0) ||
+            (strcmp(result.couplings[i].file_a, "b.go") == 0 &&
+             strcmp(result.couplings[i].file_b, "a.go") == 0)) {
+            found_pair = true;
+            ASSERT_GTE(result.couplings[i].co_change_count, 3);
+        }
+    }
+    ASSERT_TRUE(found_pair);
+
+    free_githistory_result(&result);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -5216,6 +5430,7 @@ SUITE(pipeline) {
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_js_channel_edges_attach_to_functions);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
@@ -5346,6 +5561,8 @@ SUITE(pipeline) {
     RUN_TEST(githistory_compute_change_coupling);
     RUN_TEST(githistory_coupling_skips_large_commits);
     RUN_TEST(githistory_coupling_limits_output);
+    RUN_TEST(githistory_compute_repo_path_with_spaces);
+    RUN_TEST(githistory_compute_repo_path_with_ampersand);
     /* Incremental reindex */
     /* FastAPI Depends edge tracking (PR #66 port) */
     RUN_TEST(pipeline_fastapi_depends_edges);

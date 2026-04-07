@@ -144,6 +144,42 @@ static int index_callback(const char *name, const char *path, void *ud) {
     return 0;
 }
 
+typedef struct watcher_repo_file {
+    const char *path;
+    const char *content;
+} watcher_repo_file_t;
+
+static int watcher_init_repo(const char *repo_path, const watcher_repo_file_t *files,
+                             size_t file_count) {
+    if (th_git_init_repo(repo_path) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < file_count; i++) {
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s/%s", repo_path, files[i].path);
+        if (th_write_file(full_path, files[i].content) != 0) {
+            return -1;
+        }
+    }
+
+    return th_git_commit_all(repo_path, "init");
+}
+
+static int watcher_commit_all(const char *repo_path, const char *message) {
+    return th_git_commit_all(repo_path, message);
+}
+
+static int watcher_reinit_repo(const char *repo_path, const char *message) {
+    char git_dir[1024];
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", repo_path);
+    th_rmtree(git_dir);
+    if (th_git_init_repo(repo_path) != 0) {
+        return -1;
+    }
+    return th_git_commit_all(repo_path, message);
+}
+
 TEST(watcher_poll_no_projects) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -235,13 +271,8 @@ TEST(watcher_detects_git_commit) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -257,11 +288,12 @@ TEST(watcher_detects_git_commit) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make a change: new commit */
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && echo 'world' >> file.txt && "
-             "git add file.txt && git commit -q -m 'add world'",
-             tmpdir);
-    system(cmd);
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "world\n");
+    }
+    ASSERT_EQ(watcher_commit_all(tmpdir, "add world"), 0);
 
     /* Touch to bypass interval, then poll */
     cbm_watcher_touch(w, "temp-repo");
@@ -287,13 +319,8 @@ TEST(watcher_detects_dirty_worktree) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -326,6 +353,71 @@ TEST(watcher_detects_dirty_worktree) {
     PASS();
 }
 
+TEST(watcher_detects_dirty_worktree_special_path) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm watcher & dirty_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
+        th_rmtree(tmpdir);
+        SKIP("git not available");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "dirty-special", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);
+
+    {
+        char file_path[1024];
+        snprintf(file_path, sizeof(file_path), "%s/file.txt", tmpdir);
+        th_append_file(file_path, "special path\n");
+    }
+
+    cbm_watcher_touch(w, "dirty-special");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(git_helpers_capture_output_and_exit_code) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_git_capture_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
+        th_rmtree(tmpdir);
+        SKIP("git not available");
+    }
+
+    char *output = NULL;
+    int exit_code = -1;
+    const char *ls_args[] = {"ls-files", NULL};
+    ASSERT_EQ(th_git_capture(tmpdir, ls_args, &output, &exit_code), 0);
+    ASSERT_EQ(exit_code, 0);
+    ASSERT(strstr(output, "file.txt") != NULL);
+    free(output);
+
+    output = NULL;
+    const char *bad_args[] = {"rev-parse", "refs/does-not-exist", NULL};
+    ASSERT_EQ(th_git_capture(tmpdir, bad_args, &output, &exit_code), 0);
+    ASSERT_NEQ(exit_code, 0);
+    free(output);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_detects_new_file) {
     /* Create a temporary git repo */
     char tmpdir[256];
@@ -333,13 +425,8 @@ TEST(watcher_detects_new_file) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -380,13 +467,8 @@ TEST(watcher_no_change_no_reindex) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -424,22 +506,16 @@ TEST(watcher_multiple_projects) {
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'a' > a.txt && "
-             "git add a.txt && git commit -q -m 'init'",
-             tmpdirA);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files_a[] = {{"a.txt", "a\n"}};
+    watcher_repo_file_t files_b[] = {{"b.txt", "b\n"}};
+    if (watcher_init_repo(tmpdirA, files_a, 1) != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
         SKIP("git not available");
     }
-
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'b' > b.txt && "
-             "git add b.txt && git commit -q -m 'init'",
-             tmpdirB);
-    if (system(cmd) != 0) {
+    if (watcher_init_repo(tmpdirB, files_b, 1) != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
         SKIP("git not available");
     }
 
@@ -545,13 +621,8 @@ TEST(watcher_interval_blocks_repoll) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -580,6 +651,54 @@ TEST(watcher_interval_blocks_repoll) {
     cbm_watcher_touch(w, "intv-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1); /* now detected */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_large_repo_file_count_sets_interval) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_manyfiles_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    if (th_git_init_repo(tmpdir) != 0) {
+        th_rmtree(tmpdir);
+        SKIP("git not available");
+    }
+
+    for (int i = 0; i < 550; i++) {
+        char file_path[1024];
+        char content[64];
+        snprintf(file_path, sizeof(file_path), "%s/file_%03d.go", tmpdir, i);
+        snprintf(content, sizeof(content), "package main\n\nvar File%d = %d\n", i, i);
+        ASSERT_EQ(th_write_file(file_path, content), 0);
+    }
+    ASSERT_EQ(th_git_commit_all(tmpdir, "init"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "manyfiles", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char file_path[1024];
+        snprintf(file_path, sizeof(file_path), "%s/file_000.go", tmpdir);
+        th_append_file(file_path, "var Changed = true\n");
+    }
+
+    cbm_usleep(5200 * 1000);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_usleep(1200 * 1000);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -621,13 +740,8 @@ TEST(watcher_git_removed_no_crash) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -668,13 +782,8 @@ TEST(watcher_continued_dirty) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -706,8 +815,7 @@ TEST(watcher_continued_dirty) {
     ASSERT_EQ(index_call_count, 2);
 
     /* Commit to clean up, then poll — should not trigger */
-    snprintf(cmd, sizeof(cmd), "cd '%s' && git add file.txt && git commit -q -m 'clean'", tmpdir);
-    system(cmd);
+    ASSERT_EQ(watcher_commit_all(tmpdir, "clean"), 0);
 
     /* HEAD changed → will trigger one more reindex */
     cbm_watcher_touch(w, "cont-repo");
@@ -738,13 +846,8 @@ TEST(watcher_baseline_dirty_repo) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -784,13 +887,8 @@ TEST(watcher_unwatch_prunes_state) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -832,13 +930,8 @@ TEST(watcher_watch_after_unwatch) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -895,14 +988,8 @@ TEST(watcher_detects_file_delete) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "echo 'todelete' > todelete.go && "
-             "git add -A && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}, {"todelete.go", "todelete\n"}};
+    if (watcher_init_repo(tmpdir, files, 2) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -942,13 +1029,8 @@ TEST(watcher_detects_subdir_file) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"main.go", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -977,6 +1059,143 @@ TEST(watcher_detects_subdir_file) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_detects_dirty_submodule) {
+    char parent_dir[256];
+    char submodule_src[256];
+    snprintf(parent_dir, sizeof(parent_dir), "/tmp/cbm_watcher_submodule_parent_XXXXXX");
+    snprintf(submodule_src, sizeof(submodule_src), "/tmp/cbm_watcher_submodule_src_XXXXXX");
+    if (!cbm_mkdtemp(parent_dir) || !cbm_mkdtemp(submodule_src))
+        SKIP("cbm_mkdtemp failed");
+
+    watcher_repo_file_t child_files[] = {{"lib.go", "package dep\n"}};
+    watcher_repo_file_t parent_files[] = {{"main.go", "package main\n"}};
+    if (watcher_init_repo(submodule_src, child_files, 1) != 0 ||
+        watcher_init_repo(parent_dir, parent_files, 1) != 0) {
+        th_rmtree(parent_dir);
+        th_rmtree(submodule_src);
+        SKIP("git not available");
+    }
+
+    const char *submodule_args[] = {"-c",      "protocol.file.allow=always", "submodule",
+                                    "add",     submodule_src,                "deps/sub",
+                                    NULL};
+    const char *ignore_args[] = {"config", "submodule.deps/sub.ignore", "all", NULL};
+    if (th_git_run(parent_dir, submodule_args) != 0 ||
+        th_git_run(parent_dir, ignore_args) != 0 ||
+        watcher_commit_all(parent_dir, "add submodule") != 0) {
+        th_rmtree(parent_dir);
+        th_rmtree(submodule_src);
+        SKIP("git submodule unavailable");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "submodule-repo", parent_dir);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char submodule_file[1024];
+        snprintf(submodule_file, sizeof(submodule_file), "%s/deps/sub/lib.go", parent_dir);
+        th_append_file(submodule_file, "var Dirty = true\n");
+    }
+
+    /* The parent repo ignores submodule dirtiness, so only the direct
+     * submodule probe should see this change. */
+    const char *status_args[] = {"status", "--porcelain", "--untracked-files=normal", NULL};
+    char *parent_status = NULL;
+    int status_exit = 0;
+    ASSERT_EQ(th_git_capture(parent_dir, status_args, &parent_status, &status_exit), 0);
+    ASSERT_EQ(status_exit, 0);
+    ASSERT_TRUE(parent_status && parent_status[0] == '\0');
+    free(parent_status);
+
+    cbm_watcher_touch(w, "submodule-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(parent_dir);
+    th_rmtree(submodule_src);
+    PASS();
+}
+
+TEST(watcher_ignores_submodule_paths_outside_repo) {
+    char parent_dir[256];
+    char outside_dir[256];
+    snprintf(parent_dir, sizeof(parent_dir), "/tmp/cbm_watcher_escape_parent_XXXXXX");
+    snprintf(outside_dir, sizeof(outside_dir), "/tmp/cbm_watcher_escape_outside_XXXXXX");
+    if (!cbm_mkdtemp(parent_dir) || !cbm_mkdtemp(outside_dir))
+        SKIP("cbm_mkdtemp failed");
+
+    watcher_repo_file_t parent_files[] = {{"main.go", "package main\n"}};
+    watcher_repo_file_t outside_files[] = {{"lib.go", "package outside\n"}};
+    if (watcher_init_repo(parent_dir, parent_files, 1) != 0 ||
+        watcher_init_repo(outside_dir, outside_files, 1) != 0) {
+        th_rmtree(parent_dir);
+        th_rmtree(outside_dir);
+        SKIP("git not available");
+    }
+
+    const char *outside_name = strrchr(outside_dir, '/');
+    if (!outside_name) {
+        outside_name = outside_dir;
+    } else {
+        outside_name++;
+    }
+    char gitmodules[512];
+    snprintf(gitmodules, sizeof(gitmodules),
+             "[submodule \"escape\"]\n"
+             "\tpath = ../%s\n"
+             "\turl = ../%s\n",
+             outside_name, outside_name);
+    ASSERT_EQ(th_write_file(TH_PATH(parent_dir, ".gitmodules"), gitmodules), 0);
+    ASSERT_EQ(watcher_commit_all(parent_dir, "add gitmodules"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "escape-repo", parent_dir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char outside_file[1024];
+        snprintf(outside_file, sizeof(outside_file), "%s/lib.go", outside_dir);
+        th_append_file(outside_file, "var Dirty = true\n");
+    }
+
+    const char *status_args[] = {"status", "--porcelain", "--untracked-files=normal", NULL};
+    char *parent_status = NULL;
+    int parent_exit = 0;
+    ASSERT_EQ(th_git_capture(parent_dir, status_args, &parent_status, &parent_exit), 0);
+    ASSERT_EQ(parent_exit, 0);
+    ASSERT_TRUE(parent_status && parent_status[0] == '\0');
+    free(parent_status);
+
+    char *outside_status = NULL;
+    int outside_exit = 0;
+    ASSERT_EQ(th_git_capture(outside_dir, status_args, &outside_status, &outside_exit), 0);
+    ASSERT_EQ(outside_exit, 0);
+    ASSERT_TRUE(outside_status && outside_status[0] != '\0');
+    free(outside_status);
+
+    cbm_watcher_touch(w, "escape-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(parent_dir);
+    th_rmtree(outside_dir);
     PASS();
 }
 
@@ -1014,13 +1233,8 @@ TEST(watcher_full_flow_new_file) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'package main' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"main.go", "package main\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -1066,13 +1280,8 @@ TEST(watcher_fallback_still_detects) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"main.go", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -1087,12 +1296,7 @@ TEST(watcher_fallback_still_detects) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Remove .git and re-init (simulates strategy reset) */
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf '%s/.git' && cd '%s' && git init -q && "
-             "git config user.email test@test && git config user.name test && "
-             "git add -A && git commit -q -m 'reinit'",
-             tmpdir, tmpdir);
-    system(cmd);
+    ASSERT_EQ(watcher_reinit_repo(tmpdir, "reinit"), 0);
 
     /* Re-watch with fresh state */
     cbm_watcher_unwatch(w, "fb-repo");
@@ -1128,23 +1332,16 @@ TEST(watcher_poll_only_watched_projects) {
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    /* Init both repos */
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'a' > a.txt && "
-             "git add a.txt && git commit -q -m 'init'",
-             tmpdirA);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files_a[] = {{"a.txt", "a\n"}};
+    watcher_repo_file_t files_b[] = {{"b.txt", "b\n"}};
+    if (watcher_init_repo(tmpdirA, files_a, 1) != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
         SKIP("git not available");
     }
-
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'b' > b.txt && "
-             "git add b.txt && git commit -q -m 'init'",
-             tmpdirB);
-    if (system(cmd) != 0) {
+    if (watcher_init_repo(tmpdirB, files_b, 1) != 0) {
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
         SKIP("git not available");
     }
 
@@ -1193,13 +1390,8 @@ TEST(watcher_touch_resets_immediate) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -1245,13 +1437,8 @@ TEST(watcher_modify_tracked_file) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'package main' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"main.go", "package main\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -1541,13 +1728,8 @@ TEST(watcher_callback_data_passed) {
     if (!cbm_mkdtemp(tmpdir))
         SKIP("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
+    watcher_repo_file_t files[] = {{"file.txt", "hello\n"}};
+    if (watcher_init_repo(tmpdir, files, 1) != 0) {
         th_rmtree(tmpdir);
         SKIP("git not available");
     }
@@ -1621,6 +1803,8 @@ SUITE(watcher) {
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
+    RUN_TEST(watcher_detects_dirty_worktree_special_path);
+    RUN_TEST(git_helpers_capture_output_and_exit_code);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_multiple_projects);
@@ -1630,6 +1814,7 @@ SUITE(watcher) {
 
     /* Adaptive interval behavior */
     RUN_TEST(watcher_interval_blocks_repoll);
+    RUN_TEST(watcher_large_repo_file_count_sets_interval);
     RUN_TEST(watcher_poll_interval_full_table);
 
     /* Git removal + continued dirty + baseline dirty */
@@ -1642,6 +1827,8 @@ SUITE(watcher) {
     /* FSNotify ports (adapted for git-based detection) */
     RUN_TEST(watcher_detects_file_delete);
     RUN_TEST(watcher_detects_subdir_file);
+    RUN_TEST(watcher_detects_dirty_submodule);
+    RUN_TEST(watcher_ignores_submodule_paths_outside_repo);
     RUN_TEST(watcher_free_idempotent);
     RUN_TEST(watcher_full_flow_new_file);
     RUN_TEST(watcher_fallback_still_detects);
