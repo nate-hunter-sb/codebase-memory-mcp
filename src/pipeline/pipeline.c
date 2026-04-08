@@ -116,7 +116,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 
     p->repo_path = strdup(repo_path);
     p->db_path = db_path ? strdup(db_path) : NULL;
-    p->project_name = cbm_project_name_from_path(repo_path);
+    cbm_canonicalize_project_root_path(p->repo_path);
+    p->project_name = cbm_project_name_from_path(p->repo_path);
     p->mode = mode;
     atomic_init(&p->cancelled, 0);
 

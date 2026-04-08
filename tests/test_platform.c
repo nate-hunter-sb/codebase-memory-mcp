@@ -68,6 +68,31 @@ TEST(platform_mmap_nonexistent) {
     PASS();
 }
 
+TEST(platform_canonicalize_project_root_path) {
+    char lower_drive[] = "c:\\Users\\example\\repo";
+    char upper_drive[] = "C:/Users/example/repo";
+    char posix_path[] = "/home/example/repo";
+
+    ASSERT_STR_EQ(cbm_canonicalize_project_root_path(lower_drive), "C:/Users/example/repo");
+    ASSERT_STR_EQ(cbm_canonicalize_project_root_path(upper_drive), "C:/Users/example/repo");
+    ASSERT_STR_EQ(cbm_canonicalize_project_root_path(posix_path), "/home/example/repo");
+    PASS();
+}
+
+TEST(platform_validate_project_root_path) {
+    ASSERT_TRUE(cbm_is_valid_project_root_path("C:/Users/example/repo"));
+    ASSERT_TRUE(cbm_is_valid_project_root_path("c:/Users/example/repo"));
+    ASSERT_TRUE(cbm_is_valid_project_root_path("C:\\Users\\example\\repo"));
+    ASSERT_TRUE(cbm_is_valid_project_root_path("c:\\Users\\example\\repo"));
+    ASSERT_TRUE(cbm_is_valid_project_root_path("/home/example/repo"));
+    ASSERT_FALSE(cbm_is_valid_project_root_path(""));
+    ASSERT_FALSE(cbm_is_valid_project_root_path("826"));
+    ASSERT_FALSE(cbm_is_valid_project_root_path("repo"));
+    ASSERT_FALSE(cbm_is_valid_project_root_path(":bad"));
+    ASSERT_FALSE(cbm_is_valid_project_root_path("1:/bad"));
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
@@ -77,4 +102,6 @@ SUITE(platform) {
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(platform_canonicalize_project_root_path);
+    RUN_TEST(platform_validate_project_root_path);
 }

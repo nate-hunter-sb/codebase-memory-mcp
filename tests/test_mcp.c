@@ -8,8 +8,10 @@
 #include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
+#include <sqlite3.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -988,7 +990,38 @@ typedef struct {
     cbm_mcp_server_t *srv;
     char repo_path[512];
     char project[512];
+    char cache_dir[512];
+    char previous_cache_dir[512];
+    bool had_previous_cache_dir;
 } search_code_fixture_t;
+
+enum { PROJECT_TABLE_COUNT = 7 };
+
+typedef struct {
+    const char *table;
+    const char *column;
+    bool present;
+    int rows;
+} project_table_stat_t;
+
+static void init_project_table_stats(project_table_stat_t *stats, size_t count) {
+    static const struct {
+        const char *table;
+        const char *column;
+    } defaults[PROJECT_TABLE_COUNT] = {
+        {"projects", "name"},          {"nodes", "project"},      {"edges", "project"},
+        {"file_hashes", "project"},    {"project_summaries", "project"},
+        {"node_vectors", "project"},   {"token_vectors", "project"},
+    };
+
+    size_t limit = count < PROJECT_TABLE_COUNT ? count : PROJECT_TABLE_COUNT;
+    for (size_t i = 0; i < limit; i++) {
+        stats[i].table = defaults[i].table;
+        stats[i].column = defaults[i].column;
+        stats[i].present = false;
+        stats[i].rows = 0;
+    }
+}
 
 static void normalize_test_path(char *path) {
     for (char *p = path; p && *p; p++) {
@@ -998,6 +1031,16 @@ static void normalize_test_path(char *path) {
     }
 }
 
+static void lowercase_windows_drive(char *path) {
+#ifdef _WIN32
+    if (path && isalpha((unsigned char)path[0]) && path[1] == ':') {
+        path[0] = (char)tolower((unsigned char)path[0]);
+    }
+#else
+    (void)path;
+#endif
+}
+
 static char *call_tool_text(cbm_mcp_server_t *srv, const char *tool, const char *args_json) {
     char *raw = cbm_mcp_handle_tool(srv, tool, args_json);
     char *text = extract_text_content(raw);
@@ -1005,18 +1048,294 @@ static char *call_tool_text(cbm_mcp_server_t *srv, const char *tool, const char 
     return text;
 }
 
+static int reopen_search_code_fixture_server(search_code_fixture_t *fx) {
+    if (fx->srv) {
+        cbm_mcp_server_free(fx->srv);
+        fx->srv = NULL;
+    }
+    fx->srv = cbm_mcp_server_new(NULL);
+    return fx->srv ? 0 : -1;
+}
+
+static bool path_exists(const char *path) {
+    return path && access(path, F_OK) == 0;
+}
+
+static void build_cache_db_path(const search_code_fixture_t *fx, const char *project, char *out,
+                                size_t out_sz) {
+    snprintf(out, out_sz, "%s/%s.db", fx->cache_dir, project);
+}
+
+static int derive_legacy_windows_project_name(const char *canonical_project, char *legacy_project,
+                                              size_t legacy_sz) {
+#ifdef _WIN32
+    if (!canonical_project || !isalpha((unsigned char)canonical_project[0]) ||
+        canonical_project[1] != '-' || canonical_project[2] == '\0') {
+        return -1;
+    }
+    snprintf(legacy_project, legacy_sz, "%s", canonical_project);
+    legacy_project[0] = (char)tolower((unsigned char)legacy_project[0]);
+    return 0;
+#else
+    (void)canonical_project;
+    (void)legacy_project;
+    (void)legacy_sz;
+    return -1;
+#endif
+}
+
+static int sqlite_exec_statement(sqlite3 *db, const char *sql) {
+    char *errmsg = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &errmsg);
+    if (errmsg) {
+        sqlite3_free(errmsg);
+    }
+    return rc;
+}
+
+static bool sqlite_table_exists(sqlite3 *db, const char *table) {
+    static const char *sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1;";
+    sqlite3_stmt *stmt = NULL;
+    bool exists = false;
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    (void)sqlite3_bind_text(stmt, 1, table, -1, SQLITE_STATIC);
+    exists = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+static int sqlite_count_rows_for_project_open(sqlite3 *db, const char *table, const char *column,
+                                              const char *project) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s WHERE %s = ?1;", table, column);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    (void)sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+
+    int rows = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        rows = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return rows;
+}
+
+static int sqlite_count_rows_for_project(const char *db_path, const char *table, const char *column,
+                                         const char *project) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return -1;
+    }
+
+    int rows = -1;
+    if (sqlite_table_exists(db, table)) {
+        rows = sqlite_count_rows_for_project_open(db, table, column, project);
+    }
+    sqlite3_close(db);
+    return rows;
+}
+
+static int sqlite_rewrite_project_column(sqlite3 *db, const char *table, const char *column,
+                                         const char *from_project, const char *to_project) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "UPDATE %s SET %s = ?1 WHERE %s = ?2;", table, column, column);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    (void)sqlite3_bind_text(stmt, 1, to_project, -1, SQLITE_STATIC);
+    (void)sqlite3_bind_text(stmt, 2, from_project, -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int sqlite_rewrite_projects_row(sqlite3 *db, const char *from_project, const char *to_project,
+                                       const char *root_path) {
+    static const char *sql = "UPDATE projects SET name = ?1, root_path = ?2 WHERE name = ?3;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    (void)sqlite3_bind_text(stmt, 1, to_project, -1, SQLITE_STATIC);
+    (void)sqlite3_bind_text(stmt, 2, root_path, -1, SQLITE_STATIC);
+    (void)sqlite3_bind_text(stmt, 3, from_project, -1, SQLITE_STATIC);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int capture_project_table_stats(const char *db_path, const char *project,
+                                       project_table_stat_t *stats, size_t count) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        stats[i].present = sqlite_table_exists(db, stats[i].table);
+        stats[i].rows = stats[i].present
+                            ? sqlite_count_rows_for_project_open(db, stats[i].table, stats[i].column,
+                                                                 project)
+                            : 0;
+    }
+
+    sqlite3_close(db);
+    return 0;
+}
+
+static int rewrite_project_identity_in_db(const char *db_path, const char *from_project,
+                                          const char *to_project, const char *root_path) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return -1;
+    }
+
+    int rc = -1;
+    if (sqlite_exec_statement(db, "PRAGMA foreign_keys = OFF;") != SQLITE_OK ||
+        sqlite_exec_statement(db, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+        goto cleanup;
+    }
+
+    static const char *tables[] = {
+        "nodes", "edges", "file_hashes", "project_summaries", "node_vectors", "token_vectors",
+    };
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        if (sqlite_table_exists(db, tables[i]) &&
+            sqlite_rewrite_project_column(db, tables[i], "project", from_project, to_project) !=
+                SQLITE_OK) {
+            (void)sqlite_exec_statement(db, "ROLLBACK;");
+            goto cleanup;
+        }
+    }
+
+    if (!sqlite_table_exists(db, "projects") ||
+        sqlite_rewrite_projects_row(db, from_project, to_project, root_path) != SQLITE_OK ||
+        sqlite_exec_statement(db, "COMMIT;") != SQLITE_OK) {
+        (void)sqlite_exec_statement(db, "ROLLBACK;");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    (void)sqlite_exec_statement(db, "PRAGMA foreign_keys = ON;");
+    sqlite3_close(db);
+    return rc;
+}
+
+static int materialize_legacy_cache_variant(search_code_fixture_t *fx, bool keep_canonical_copy,
+                                            char *legacy_project, size_t legacy_project_sz,
+                                            char *canonical_db_path, size_t canonical_db_path_sz,
+                                            char *legacy_db_path, size_t legacy_db_path_sz,
+                                            project_table_stat_t *table_stats,
+                                            size_t table_stats_count) {
+#ifndef _WIN32
+    (void)fx;
+    (void)keep_canonical_copy;
+    (void)legacy_project;
+    (void)legacy_project_sz;
+    (void)canonical_db_path;
+    (void)canonical_db_path_sz;
+    (void)legacy_db_path;
+    (void)legacy_db_path_sz;
+    (void)table_stats;
+    (void)table_stats_count;
+    return -1;
+#else
+    (void)keep_canonical_copy;
+    if (derive_legacy_windows_project_name(fx->project, legacy_project, legacy_project_sz) != 0) {
+        return -1;
+    }
+
+    build_cache_db_path(fx, fx->project, canonical_db_path, canonical_db_path_sz);
+    build_cache_db_path(fx, legacy_project, legacy_db_path, legacy_db_path_sz);
+    if (!path_exists(canonical_db_path)) {
+        return -1;
+    }
+
+    if (table_stats && table_stats_count > 0 &&
+        capture_project_table_stats(canonical_db_path, fx->project, table_stats, table_stats_count) !=
+            0) {
+        return -1;
+    }
+
+    char legacy_root[sizeof(fx->repo_path)];
+    snprintf(legacy_root, sizeof(legacy_root), "%s", fx->repo_path);
+    lowercase_windows_drive(legacy_root);
+    return rewrite_project_identity_in_db(canonical_db_path, fx->project, legacy_project, legacy_root);
+#endif
+}
+
+static int count_listed_projects_named(const char *list_text, const char *project_name) {
+    yyjson_doc *doc = yyjson_read(list_text, strlen(list_text), 0);
+    if (!doc) {
+        return -1;
+    }
+
+    int count = 0;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *projects = yyjson_obj_get(root, "projects");
+    if (projects && yyjson_is_arr(projects)) {
+        size_t idx, max;
+        yyjson_val *item;
+        yyjson_arr_foreach(projects, idx, max, item) {
+            const char *name = yyjson_get_str(yyjson_obj_get(item, "name"));
+            if (name && strcmp(name, project_name) == 0) {
+                count++;
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return count;
+}
+
 static void cleanup_search_code_fixture(search_code_fixture_t *fx) {
     if (fx->srv) {
         cbm_mcp_server_free(fx->srv);
         fx->srv = NULL;
+    }
+    if (fx->had_previous_cache_dir) {
+        (void)cbm_setenv("CBM_CACHE_DIR", fx->previous_cache_dir, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (fx->cache_dir[0]) {
+        th_cleanup(fx->cache_dir);
     }
     if (fx->repo_path[0]) {
         th_cleanup(fx->repo_path);
     }
 }
 
-static int setup_search_code_fixture(search_code_fixture_t *fx, const char *prefix) {
+static int setup_search_code_fixture_impl(search_code_fixture_t *fx, const char *prefix,
+                                          bool lowercase_drive_repo_path) {
     memset(fx, 0, sizeof(*fx));
+
+    const char *prev_cache_dir = getenv("CBM_CACHE_DIR");
+    if (prev_cache_dir) {
+        snprintf(fx->previous_cache_dir, sizeof(fx->previous_cache_dir), "%s", prev_cache_dir);
+        fx->had_previous_cache_dir = true;
+    }
 
     char *tmp = th_mktempdir(prefix);
     if (!tmp) {
@@ -1024,6 +1343,20 @@ static int setup_search_code_fixture(search_code_fixture_t *fx, const char *pref
     }
     snprintf(fx->repo_path, sizeof(fx->repo_path), "%s", tmp);
     normalize_test_path(fx->repo_path);
+
+    char cache_prefix[128];
+    snprintf(cache_prefix, sizeof(cache_prefix), "%s-cache", prefix);
+    char *cache_tmp = th_mktempdir(cache_prefix);
+    if (!cache_tmp) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
+    snprintf(fx->cache_dir, sizeof(fx->cache_dir), "%s", cache_tmp);
+    normalize_test_path(fx->cache_dir);
+    if (cbm_setenv("CBM_CACHE_DIR", fx->cache_dir, 1) != 0) {
+        cleanup_search_code_fixture(fx);
+        return -1;
+    }
 
     if (th_write_file(TH_PATH(fx->repo_path, "src/alpha.py"),
                       "from src.nested.beta import alpha_handler\n"
@@ -1069,7 +1402,13 @@ static int setup_search_code_fixture(search_code_fixture_t *fx, const char *pref
         return -1;
     }
 
-    char *project = cbm_project_name_from_path(fx->repo_path);
+    char index_repo_path[sizeof(fx->repo_path)];
+    snprintf(index_repo_path, sizeof(index_repo_path), "%s", fx->repo_path);
+    if (lowercase_drive_repo_path) {
+        lowercase_windows_drive(index_repo_path);
+    }
+
+    char *project = cbm_project_name_from_path(index_repo_path);
     if (!project) {
         cleanup_search_code_fixture(fx);
         return -1;
@@ -1078,7 +1417,7 @@ static int setup_search_code_fixture(search_code_fixture_t *fx, const char *pref
     free(project);
 
     char args[1024];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", fx->repo_path);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", index_repo_path);
     char *text = call_tool_text(fx->srv, "index_repository", args);
     if (!text) {
         cleanup_search_code_fixture(fx);
@@ -1092,6 +1431,10 @@ static int setup_search_code_fixture(search_code_fixture_t *fx, const char *pref
     }
 
     return 0;
+}
+
+static int setup_search_code_fixture(search_code_fixture_t *fx, const char *prefix) {
+    return setup_search_code_fixture_impl(fx, prefix, false);
 }
 
 static int json_array_size(yyjson_val *root, const char *key) {
@@ -1143,6 +1486,145 @@ static char *call_snippet(cbm_mcp_server_t *srv, const char *args_json) {
     char *text = extract_text_content(raw);
     free(raw);
     return text;
+}
+
+static int assert_search_code_has_results(search_code_fixture_t *fx, const char *args_json,
+                                          const char *required_prefix) {
+    char *text = call_tool_text(fx->srv, "search_code", args_json);
+    ASSERT_NOT_NULL(text);
+
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_GT(json_array_size(root, "results"), 0);
+    if (required_prefix) {
+        ASSERT_TRUE(all_result_files_have_prefix(root, required_prefix));
+    }
+
+    yyjson_doc_free(doc);
+    free(text);
+    return 0;
+}
+
+static int verify_project_table_migration(const char *canonical_db_path, const char *canonical_project,
+                                          const char *legacy_project,
+                                          project_table_stat_t *table_stats, size_t table_stats_count) {
+    for (size_t i = 0; i < table_stats_count; i++) {
+        if (!table_stats[i].present) {
+            continue;
+        }
+        int canonical_rows = sqlite_count_rows_for_project(canonical_db_path, table_stats[i].table,
+                                                           table_stats[i].column, canonical_project);
+        int legacy_rows = sqlite_count_rows_for_project(canonical_db_path, table_stats[i].table,
+                                                        table_stats[i].column, legacy_project);
+        ASSERT_EQ(canonical_rows, table_stats[i].rows);
+        ASSERT_EQ(legacy_rows, 0);
+    }
+    return 0;
+}
+
+static int assert_project_root_matches(const char *db_path, const char *project,
+                                       const char *expected_root) {
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+
+    cbm_project_t proj = {0};
+    ASSERT_EQ(cbm_store_get_project(store, project, &proj), CBM_STORE_OK);
+    ASSERT_STR_EQ(proj.root_path, expected_root);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(store);
+    return 0;
+}
+
+static int exercise_legacy_windows_cache_roundtrip(const char *prefix) {
+#ifndef _WIN32
+    (void)prefix;
+    return 0;
+#else
+    search_code_fixture_t fx;
+    project_table_stat_t table_stats[PROJECT_TABLE_COUNT];
+    init_project_table_stats(table_stats, PROJECT_TABLE_COUNT);
+    ASSERT_EQ(setup_search_code_fixture(&fx, prefix), 0);
+
+    if (fx.srv) {
+        cbm_mcp_server_free(fx.srv);
+        fx.srv = NULL;
+    }
+
+    char legacy_project[sizeof(fx.project)];
+    char canonical_db_path[1024];
+    char legacy_db_path[1024];
+    ASSERT_EQ(materialize_legacy_cache_variant(&fx, false, legacy_project, sizeof(legacy_project),
+                                              canonical_db_path, sizeof(canonical_db_path),
+                                              legacy_db_path, sizeof(legacy_db_path), table_stats,
+                                              PROJECT_TABLE_COUNT),
+              0);
+    ASSERT_EQ(sqlite_count_rows_for_project(canonical_db_path, "projects", "name", legacy_project), 1);
+    ASSERT_EQ(sqlite_count_rows_for_project(canonical_db_path, "projects", "name", fx.project), 0);
+
+    ASSERT_EQ(reopen_search_code_fixture_server(&fx), 0);
+
+    char *list_text = call_tool_text(fx.srv, "list_projects", "{}");
+    ASSERT_NOT_NULL(list_text);
+    ASSERT_EQ(count_listed_projects_named(list_text, fx.project), 1);
+    ASSERT_EQ(count_listed_projects_named(list_text, legacy_project), 0);
+    free(list_text);
+
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", fx.project);
+    char *status_text = call_tool_text(fx.srv, "index_status", args);
+    ASSERT_NOT_NULL(status_text);
+    ASSERT_NULL(strstr(status_text, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(status_text, "\"status\":\"ready\""));
+    free(status_text);
+
+    ASSERT_EQ(
+        verify_project_table_migration(canonical_db_path, fx.project, legacy_project, table_stats,
+                                       PROJECT_TABLE_COUNT),
+        0);
+    ASSERT_EQ(assert_project_root_matches(canonical_db_path, fx.project, fx.repo_path), 0);
+
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", fx.project);
+    char *arch_text = call_tool_text(fx.srv, "get_architecture", args);
+    ASSERT_NOT_NULL(arch_text);
+    ASSERT_NULL(strstr(arch_text, "\"isError\":true"));
+    free(arch_text);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"mode\":\"update\","
+             "\"content\":\"# Legacy Cache ADR\\n\\nWindows compatibility\"}",
+             fx.project);
+    char *adr_update = call_tool_text(fx.srv, "manage_adr", args);
+    ASSERT_NOT_NULL(adr_update);
+    ASSERT_NULL(strstr(adr_update, "\"isError\":true"));
+    free(adr_update);
+
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"mode\":\"get\"}", fx.project);
+    char *adr_get = call_tool_text(fx.srv, "manage_adr", args);
+    ASSERT_NOT_NULL(adr_get);
+    ASSERT_NOT_NULL(strstr(adr_get, "Legacy Cache ADR"));
+    free(adr_get);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"alpha_handler\",\"mode\":\"compact\",\"limit\":3}",
+             fx.project);
+    ASSERT_EQ(assert_search_code_has_results(&fx, args, NULL), 0);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"FILTER_SCOPE_TOKEN\",\"mode\":\"compact\","
+             "\"file_pattern\":\"*.py\",\"limit\":5}",
+             fx.project);
+    ASSERT_EQ(assert_search_code_has_results(&fx, args, "src/"), 0);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"PATH_FILTER_TOKEN\",\"mode\":\"compact\","
+             "\"path_filter\":\"^src/\",\"limit\":5}",
+             fx.project);
+    ASSERT_EQ(assert_search_code_has_results(&fx, args, "src/"), 0);
+
+    cleanup_search_code_fixture(&fx);
+    return 0;
+#endif
 }
 
 TEST(tool_search_code_windows_safe_name_repo_path) {
@@ -1353,6 +1835,61 @@ TEST(tool_search_code_fixture_modes_filters_and_context) {
 
     cleanup_search_code_fixture(&fx);
     PASS();
+}
+
+TEST(tool_windows_legacy_cache_roundtrip_ampersand_repo_path) {
+#ifndef _WIN32
+    PASS();
+#else
+    ASSERT_EQ(exercise_legacy_windows_cache_roundtrip("repo&path"), 0);
+    PASS();
+#endif
+}
+
+TEST(tool_windows_legacy_cache_roundtrip_safe_name_repo_path) {
+#ifndef _WIN32
+    PASS();
+#else
+    ASSERT_EQ(exercise_legacy_windows_cache_roundtrip("safe-name-repo"), 0);
+    PASS();
+#endif
+}
+
+TEST(tool_windows_list_projects_canonicalizes_legacy_single_cache) {
+#ifndef _WIN32
+    PASS();
+#else
+    search_code_fixture_t fx;
+    ASSERT_EQ(setup_search_code_fixture(&fx, "legacy-listing"), 0);
+
+    if (fx.srv) {
+        cbm_mcp_server_free(fx.srv);
+        fx.srv = NULL;
+    }
+
+    char legacy_project[sizeof(fx.project)];
+    char canonical_db_path[1024];
+    char legacy_db_path[1024];
+    ASSERT_EQ(materialize_legacy_cache_variant(&fx, false, legacy_project, sizeof(legacy_project),
+                                              canonical_db_path, sizeof(canonical_db_path),
+                                              legacy_db_path, sizeof(legacy_db_path), NULL, 0),
+              0);
+    ASSERT_EQ(sqlite_count_rows_for_project(canonical_db_path, "projects", "name", legacy_project), 1);
+    ASSERT_EQ(sqlite_count_rows_for_project(canonical_db_path, "projects", "name", fx.project), 0);
+
+    ASSERT_EQ(reopen_search_code_fixture_server(&fx), 0);
+
+    char *list_text = call_tool_text(fx.srv, "list_projects", "{}");
+    ASSERT_NOT_NULL(list_text);
+    ASSERT_EQ(count_listed_projects_named(list_text, fx.project), 1);
+    ASSERT_EQ(count_listed_projects_named(list_text, legacy_project), 0);
+    free(list_text);
+    ASSERT_EQ(sqlite_count_rows_for_project(canonical_db_path, "projects", "name", legacy_project), 1);
+    ASSERT_EQ(sqlite_count_rows_for_project(canonical_db_path, "projects", "name", fx.project), 0);
+
+    cleanup_search_code_fixture(&fx);
+    PASS();
+#endif
 }
 
 /* ── TestSnippet_ExactQN ──────────────────────────────────────── */
@@ -2079,6 +2616,9 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_windows_ampersand_repo_path);
     RUN_TEST(tool_search_code_windows_temp_file_regression);
     RUN_TEST(tool_search_code_fixture_modes_filters_and_context);
+    RUN_TEST(tool_windows_legacy_cache_roundtrip_ampersand_repo_path);
+    RUN_TEST(tool_windows_legacy_cache_roundtrip_safe_name_repo_path);
+    RUN_TEST(tool_windows_list_projects_canonicalizes_legacy_single_cache);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);

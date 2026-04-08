@@ -1,0 +1,23 @@
+# codebase-memory-mcp ignore file
+# Keep indexing focused on active source and docs instead of vendored code,
+# build output, local state, copied artifacts, and scratch directories.
+
+.git/
+.codebase-memory/
+Safe to Delete/
+build/
+bin/
+node_modules/
+graph-ui/dist/
+*.db
+*.db-shm
+*.db-wal
+*.test
+*.out
+coverage.txt
+cbm_*/
+cli-*/
+soak-results/
+artifacts/
+vendored/
+

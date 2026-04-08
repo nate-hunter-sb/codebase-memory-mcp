@@ -116,4 +116,13 @@ int64_t cbm_file_size(const char *path);
  * On POSIX, this is a no-op. Returns the input pointer. */
 char *cbm_normalize_path_sep(char *path);
 
+/* Canonicalize a project root path in-place.
+ * Converts backslashes to forward slashes and uppercases Windows drive letters
+ * in paths like c:/repo. Returns the input pointer. */
+char *cbm_canonicalize_project_root_path(char *path);
+
+/* Check whether a path is a valid absolute project root path.
+ * Accepts POSIX /... and Windows drive paths like C:/... or C:\... . */
+bool cbm_is_valid_project_root_path(const char *path);
+
 #endif /* CBM_PLATFORM_H */

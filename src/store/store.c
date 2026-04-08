@@ -631,19 +631,21 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
     sqlite3_finalize(stmt);
 
     if (ok) {
-        /* Check that root_path in projects table starts with '/' or a drive letter.
-         * Corrupt DBs often have numeric strings like "826" in root_path. */
-        rc = sqlite3_prepare_v2(
-            s->db,
-            "SELECT root_path FROM projects WHERE root_path != '' "
-            "AND substr(root_path, 1, 1) NOT IN ('/', 'A','B','C','D','E','F','G','H') LIMIT 1;",
-            CBM_NOT_FOUND, &stmt, NULL);
+        /* Corrupt DBs often have numeric strings like "826" in root_path.
+         * Validate project roots in C so Windows drive letters are handled
+         * consistently regardless of case. */
+        rc = sqlite3_prepare_v2(s->db, "SELECT root_path FROM projects;", CBM_NOT_FOUND, &stmt,
+                                NULL);
         if (rc == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                const char *bad_path = (const char *)sqlite3_column_text(stmt, 0);
-                (void)fprintf(stderr, "ERROR store.corrupt table=projects bad_root_path=%s\n",
-                              bad_path ? bad_path : "(null)");
-                ok = false;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *root_path = (const char *)sqlite3_column_text(stmt, 0);
+                if (!cbm_is_valid_project_root_path(root_path)) {
+                    (void)fprintf(stderr,
+                                  "ERROR store.corrupt table=projects bad_root_path=%s\n",
+                                  root_path ? root_path : "(null)");
+                    ok = false;
+                    break;
+                }
             }
             sqlite3_finalize(stmt);
         }
@@ -873,12 +875,18 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
 
     char ts[CBM_SZ_64];
     iso_now(ts, sizeof(ts));
+    char *canonical_root = root_path ? strdup(root_path) : strdup("");
+    if (!canonical_root) {
+        return CBM_STORE_ERR;
+    }
+    cbm_canonicalize_project_root_path(canonical_root);
 
     bind_text(stmt, SKIP_ONE, name);
     bind_text(stmt, ST_COL_2, ts);
-    bind_text(stmt, ST_COL_3, root_path);
+    bind_text(stmt, ST_COL_3, canonical_root);
 
     int rc = sqlite3_step(stmt);
+    free(canonical_root);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "upsert_project");
         return CBM_STORE_ERR;

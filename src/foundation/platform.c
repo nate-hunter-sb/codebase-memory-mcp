@@ -6,10 +6,16 @@
 #include "platform.h"
 
 #include "foundation/constants.h"
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+static bool is_windows_drive_path(const char *path) {
+    return path && isalpha((unsigned char)path[0]) && path[1] == ':' &&
+           (path[2] == '/' || path[2] == '\\');
+}
 
 #ifdef _WIN32
 
@@ -107,6 +113,14 @@ char *cbm_normalize_path_sep(char *path) {
                 *p = '/';
             }
         }
+    }
+    return path;
+}
+
+char *cbm_canonicalize_project_root_path(char *path) {
+    cbm_normalize_path_sep(path);
+    if (is_windows_drive_path(path)) {
+        path[0] = (char)toupper((unsigned char)path[0]);
     }
     return path;
 }
@@ -240,7 +254,25 @@ char *cbm_normalize_path_sep(char *path) {
     return path;
 }
 
+char *cbm_canonicalize_project_root_path(char *path) {
+    cbm_normalize_path_sep(path);
+    if (is_windows_drive_path(path)) {
+        path[0] = (char)toupper((unsigned char)path[0]);
+    }
+    return path;
+}
+
 #endif /* _WIN32 */
+
+bool cbm_is_valid_project_root_path(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (path[0] == '/') {
+        return true;
+    }
+    return is_windows_drive_path(path);
+}
 
 /* ── Environment variables ────────────────────────────────────── */
 

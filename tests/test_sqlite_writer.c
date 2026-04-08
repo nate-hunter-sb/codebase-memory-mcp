@@ -297,6 +297,31 @@ TEST(sw_empty) {
     PASS();
 }
 
+TEST(sw_canonicalizes_windows_project_root) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    int rc =
+        cbm_write_db(path, "win", "c:/Users/example/repo", "2026-03-14T00:00:00Z", NULL, 0, NULL,
+                     0, NULL, 0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db, "SELECT root_path FROM projects WHERE name='win'", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "C:/Users/example/repo");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    unlink(path);
+    PASS();
+}
+
 /* --- Ported from scale_debug_test.go: TestWriteDB_MultiPage --- */
 TEST(sw_multi_page) {
     char path[256];
@@ -380,5 +405,6 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_minimal_data);
     RUN_TEST(sw_scale_and_indexes);
     RUN_TEST(sw_empty);
+    RUN_TEST(sw_canonicalizes_windows_project_root);
     RUN_TEST(sw_multi_page);
 }

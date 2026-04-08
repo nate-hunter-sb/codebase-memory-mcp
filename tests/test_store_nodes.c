@@ -908,6 +908,32 @@ TEST(store_integrity_clean) {
     PASS();
 }
 
+TEST(store_integrity_windows_drive_uppercase) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('win-upper', '2024-01-01', 'C:/Users/example/repo');",
+                 NULL, NULL, NULL);
+    ASSERT_TRUE(cbm_store_check_integrity(s));
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_windows_drive_lowercase) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('win-lower', '2024-01-01', 'c:/Users/example/repo');",
+                 NULL, NULL, NULL);
+    ASSERT_TRUE(cbm_store_check_integrity(s));
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_integrity_empty) {
     /* An empty store (no project rows) should pass — 0 rows is fine */
     cbm_store_t *s = cbm_store_open_memory();
@@ -953,6 +979,22 @@ TEST(store_integrity_corrupt_too_many_rows) {
 TEST(store_integrity_null_check) {
     /* NULL store should return false (not crash) */
     ASSERT_FALSE(cbm_store_check_integrity(NULL));
+    PASS();
+}
+
+TEST(store_project_upsert_canonicalizes_windows_root) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "win-proj", "c:/Users/example/repo"), CBM_STORE_OK);
+
+    cbm_project_t p = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "win-proj", &p), CBM_STORE_OK);
+    ASSERT_STR_EQ(p.root_path, "C:/Users/example/repo");
+    free((void *)p.name);
+    free((void *)p.indexed_at);
+    free((void *)p.root_path);
+
+    cbm_store_close(s);
     PASS();
 }
 
@@ -1504,10 +1546,13 @@ SUITE(store_nodes) {
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
     RUN_TEST(store_integrity_clean);
+    RUN_TEST(store_integrity_windows_drive_uppercase);
+    RUN_TEST(store_integrity_windows_drive_lowercase);
     RUN_TEST(store_integrity_empty);
     RUN_TEST(store_integrity_corrupt_bad_path);
     RUN_TEST(store_integrity_corrupt_too_many_rows);
     RUN_TEST(store_integrity_null_check);
+    RUN_TEST(store_project_upsert_canonicalizes_windows_root);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);

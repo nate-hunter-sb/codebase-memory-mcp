@@ -408,6 +408,14 @@ TEST(project_name_windows_path) {
     PASS();
 }
 
+TEST(project_name_windows_path_lowercase_drive) {
+    ASSERT_FQN(cbm_project_name_from_path("c:/Users/dev/project"),
+               "C-Users-dev-project");
+    ASSERT_FQN(cbm_project_name_from_path("c:\\Users\\dev\\project"),
+               "C-Users-dev-project");
+    PASS();
+}
+
 TEST(project_name_with_colons) {
     /* Colons replaced with dashes (e.g., C: drive) */
     ASSERT_FQN(cbm_project_name_from_path("C:/dev/proj"),
@@ -576,6 +584,7 @@ SUITE(fqn) {
     /* project_name_from_path */
     RUN_TEST(project_name_unix_path);
     RUN_TEST(project_name_windows_path);
+    RUN_TEST(project_name_windows_path_lowercase_drive);
     RUN_TEST(project_name_with_colons);
     RUN_TEST(project_name_multiple_slashes);
     RUN_TEST(project_name_leading_trailing_slashes);

@@ -17,6 +17,7 @@
 #include "sqlite_writer.h"
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
+#include "foundation/platform.h"
 #include "foundation/profile.h"
 
 #include <stddef.h> // NULL
@@ -1826,15 +1827,22 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                  const char *indexed_at, CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges,
                  int edge_count, CBMDumpVector *vectors, int vector_count,
                  CBMDumpTokenVec *token_vecs, int token_vec_count) {
+    char *canonical_root_path = root_path ? strdup(root_path) : strdup("");
+    if (!canonical_root_path) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_canonicalize_project_root_path(canonical_root_path);
+
     FILE *fp = fopen(path, "wb");
     if (!fp) {
+        free(canonical_root_path);
         return CBM_NOT_FOUND;
     }
 
     write_db_ctx_t w = {.fp = fp,
                         .next_page = FIRST_DATA_PAGE,
                         .project = project,
-                        .root_path = root_path,
+                        .root_path = canonical_root_path,
                         .indexed_at = indexed_at,
                         .nodes = nodes,
                         .node_count = node_count,
@@ -1854,6 +1862,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     int rc = write_data_tables(&w, &nodes_root, &edges_root, &vectors_root, &token_vecs_root);
     if (rc != 0) {
         (void)fclose(fp);
+        free(canonical_root_path);
         return rc;
     }
     CBM_PROF_END_N("write_db", "1_data_tables", t_data, node_count + edge_count);
@@ -1908,6 +1917,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     CBM_PROF_END_N("write_db", "4_node_indexes_seq", t_node_idx, node_count * NODE_SORT_THREADS);
     if (nrc != 0) {
         (void)fclose(fp);
+        free(canonical_root_path);
         return nrc;
     }
 
@@ -1926,6 +1936,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     CBM_PROF_END_N("write_db", "5_edge_indexes_seq", t_edge_idx, edge_count * EDGE_SORT_THREADS);
     if (erc != 0) {
         (void)fclose(fp);
+        free(canonical_root_path);
         return erc;
     }
 
@@ -2031,9 +2042,11 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     int rc2 = write_master_page1(fp, master, master_count, next_page);
     if (rc2 != 0) {
         (void)fclose(fp);
+        free(canonical_root_path);
         return rc2;
     }
     pad_file_to_page_boundary(fp, next_page);
     (void)fclose(fp);
+    free(canonical_root_path);
     return 0;
 }

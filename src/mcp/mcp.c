@@ -63,6 +63,7 @@ enum {
 #include <fcntl.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <ctype.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -599,12 +600,71 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv) {
     return srv ? srv->store : NULL;
 }
 
+static bool is_windows_drive_project_name(const char *project) {
+#ifdef _WIN32
+    return project && isalpha((unsigned char)project[0]) && project[1] == '-' && project[2] != '\0';
+#else
+    (void)project;
+    return false;
+#endif
+}
+
+static bool is_windows_absolute_root_path(const char *path) {
+#ifdef _WIN32
+    return path && isalpha((unsigned char)path[0]) && path[1] == ':' &&
+           (path[2] == '/' || path[2] == '\\');
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+static void canonicalize_windows_drive_project_name(char *project) {
+#ifdef _WIN32
+    if (is_windows_drive_project_name(project)) {
+        project[0] = (char)toupper((unsigned char)project[0]);
+    }
+#else
+    (void)project;
+#endif
+}
+
+static void copy_canonical_project_name(const char *project, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    snprintf(out, out_sz, "%s", project ? project : "");
+    canonicalize_windows_drive_project_name(out);
+}
+
+static bool derive_windows_drive_project_variant(const char *project, char *variant,
+                                                 size_t variant_sz) {
+#ifdef _WIN32
+    if (!is_windows_drive_project_name(project) || !variant || variant_sz == 0) {
+        return false;
+    }
+    snprintf(variant, variant_sz, "%s", project);
+    if (isupper((unsigned char)variant[0])) {
+        variant[0] = (char)tolower((unsigned char)variant[0]);
+    } else {
+        variant[0] = (char)toupper((unsigned char)variant[0]);
+    }
+    return true;
+#else
+    (void)project;
+    (void)variant;
+    (void)variant_sz;
+    return false;
+#endif
+}
+
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     if (!srv) {
         return;
     }
     free(srv->current_project);
     srv->current_project = project ? heap_strdup(project) : NULL;
+    canonicalize_windows_drive_project_name(srv->current_project);
 }
 
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
@@ -686,16 +746,403 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
     return buf;
 }
 
+typedef struct {
+    char display_name[CBM_SZ_1K];
+    char full_path[CBM_SZ_2K];
+    struct stat st;
+    bool canonical_file;
+} cache_project_listing_t;
+
+static void project_db_sidecar_path(const char *db_path, const char *suffix, char *buf, size_t bufsz) {
+    snprintf(buf, bufsz, "%s%s", db_path, suffix);
+}
+
+static void delete_project_db_artifacts(const char *db_path) {
+    if (!db_path) {
+        return;
+    }
+    cbm_unlink(db_path);
+    char wal_path[MCP_FIELD_SIZE];
+    char shm_path[MCP_FIELD_SIZE];
+    project_db_sidecar_path(db_path, "-wal", wal_path, sizeof(wal_path));
+    project_db_sidecar_path(db_path, "-shm", shm_path, sizeof(shm_path));
+    cbm_unlink(wal_path);
+    cbm_unlink(shm_path);
+}
+
+static bool rename_path_if_exists(const char *from_path, const char *to_path) {
+    if (!cbm_file_exists(from_path)) {
+        return true;
+    }
+    return rename(from_path, to_path) == 0;
+}
+
+#ifdef _WIN32
+static bool windows_paths_refer_to_same_file(const char *lhs, const char *rhs) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    HANDLE left = CreateFileA(lhs, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (left == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    HANDLE right = CreateFileA(rhs, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (right == INVALID_HANDLE_VALUE) {
+        CloseHandle(left);
+        return false;
+    }
+
+    BY_HANDLE_FILE_INFORMATION left_info;
+    BY_HANDLE_FILE_INFORMATION right_info;
+    bool same_file = GetFileInformationByHandle(left, &left_info) &&
+                     GetFileInformationByHandle(right, &right_info) &&
+                     left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
+                     left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
+                     left_info.nFileIndexLow == right_info.nFileIndexLow;
+
+    CloseHandle(right);
+    CloseHandle(left);
+    return same_file;
+}
+#endif
+
+static bool sqlite_table_exists(sqlite3 *db, const char *table_name) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1;";
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_TRANSIENT);
+    bool exists = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+static int sqlite_exec_project_update(sqlite3 *db, const char *table_name, const char *column_name,
+                                      const char *from_project, const char *to_project) {
+    char sql[192];
+    sqlite3_stmt *stmt = NULL;
+    snprintf(sql, sizeof(sql), "UPDATE %s SET %s=?1 WHERE %s=?2;", table_name, column_name,
+             column_name);
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, to_project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, from_project, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+static int sqlite_update_project_identity(sqlite3 *db, const char *from_project,
+                                          const char *to_project, const char *root_path) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "UPDATE projects SET name=?1, root_path=?2 WHERE name=?3;";
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, to_project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, root_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, from_project, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+static bool copy_single_project_from_store(cbm_store_t *store, cbm_project_t *out) {
+    cbm_project_t *projects = NULL;
+    int count = 0;
+    if (cbm_store_list_projects(store, &projects, &count) != CBM_STORE_OK) {
+        return false;
+    }
+    if (count != 1) {
+        cbm_store_free_projects(projects, count);
+        return false;
+    }
+    *out = projects[0];
+    free(projects);
+    return true;
+}
+
+static bool is_project_db_file(const char *name, size_t len);
+
+static int find_project_listing(cache_project_listing_t *entries, int count,
+                                const char *display_name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(entries[i].display_name, display_name) == 0) {
+            return i;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+static int scan_visible_cache_projects(const char *dir_path, cache_project_listing_t **out_entries,
+                                       int *out_count) {
+    *out_entries = NULL;
+    *out_count = 0;
+
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        return 0;
+    }
+
+    int cap = 8;
+    int count = 0;
+    cache_project_listing_t *entries = malloc((size_t)cap * sizeof(*entries));
+    if (!entries) {
+        cbm_closedir(d);
+        return 0;
+    }
+
+    cbm_dirent_t *entry = NULL;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *name = entry->name;
+        size_t len = strlen(name);
+        if (!is_project_db_file(name, len)) {
+            continue;
+        }
+
+        char raw_name[CBM_SZ_1K];
+        snprintf(raw_name, sizeof(raw_name), "%.*s", (int)(len - MCP_DB_EXT), name);
+
+        char display_name[CBM_SZ_1K];
+        copy_canonical_project_name(raw_name, display_name, sizeof(display_name));
+
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+
+        struct stat st;
+        if (stat(full_path, &st) != 0) {
+            continue;
+        }
+
+        bool canonical_file = strcmp(raw_name, display_name) == 0;
+        int existing = find_project_listing(entries, count, display_name);
+        if (existing >= 0) {
+            if (canonical_file && !entries[existing].canonical_file) {
+                snprintf(entries[existing].display_name, sizeof(entries[existing].display_name),
+                         "%s", display_name);
+                snprintf(entries[existing].full_path, sizeof(entries[existing].full_path), "%s",
+                         full_path);
+                entries[existing].st = st;
+                entries[existing].canonical_file = true;
+            }
+            continue;
+        }
+
+        if (count >= cap) {
+            cap *= 2;
+            cache_project_listing_t *grown = realloc(entries, (size_t)cap * sizeof(*entries));
+            if (!grown) {
+                break;
+            }
+            entries = grown;
+        }
+
+        snprintf(entries[count].display_name, sizeof(entries[count].display_name), "%s",
+                 display_name);
+        snprintf(entries[count].full_path, sizeof(entries[count].full_path), "%s", full_path);
+        entries[count].st = st;
+        entries[count].canonical_file = canonical_file;
+        count++;
+    }
+
+    cbm_closedir(d);
+    *out_entries = entries;
+    *out_count = count;
+    return count;
+}
+
+static cbm_store_t *adopt_open_store(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
+                                     const char *db_path) {
+    if (!store) {
+        return NULL;
+    }
+
+    if (!cbm_store_check_integrity(store)) {
+        cbm_log_error("store.auto_clean", "project", project, "path", db_path, "action",
+                      "deleting corrupt db - re-index required");
+        cbm_store_close(store);
+        delete_project_db_artifacts(db_path);
+        return NULL;
+    }
+
+    cbm_project_t proj_verify = {0};
+    if (cbm_store_get_project(store, project, &proj_verify) != CBM_STORE_OK) {
+        cbm_store_close(store);
+        return NULL;
+    }
+    cbm_project_free_fields(&proj_verify);
+
+    srv->store = store;
+    srv->owns_store = true;
+    free(srv->current_project);
+    srv->current_project = heap_strdup(project);
+    canonicalize_windows_drive_project_name(srv->current_project);
+    return store;
+}
+
+static cbm_store_t *open_project_store_path(cbm_mcp_server_t *srv, const char *project,
+                                            const char *db_path) {
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    return adopt_open_store(srv, store, project, db_path);
+}
+
+static bool migrate_legacy_windows_cache(const char *canonical_project, const char *canonical_path) {
+#ifndef _WIN32
+    (void)canonical_project;
+    (void)canonical_path;
+    return false;
+#else
+    char legacy_project[CBM_SZ_1K];
+    if (!derive_windows_drive_project_variant(canonical_project, legacy_project,
+                                              sizeof(legacy_project))) {
+        return false;
+    }
+
+    char legacy_path[CBM_SZ_1K];
+    project_db_path(legacy_project, legacy_path, sizeof(legacy_path));
+    if (!cbm_file_exists(legacy_path)) {
+        return false;
+    }
+
+    bool canonical_exists = cbm_file_exists(canonical_path);
+    bool case_alias = canonical_exists && windows_paths_refer_to_same_file(legacy_path, canonical_path);
+    if (canonical_exists && !case_alias) {
+        return false;
+    }
+
+    cbm_store_t *legacy_store = cbm_store_open_path_query(legacy_path);
+    if (!legacy_store) {
+        return false;
+    }
+    if (!cbm_store_check_integrity(legacy_store)) {
+        cbm_store_close(legacy_store);
+        return false;
+    }
+
+    cbm_project_t stored_project = {0};
+    bool tx_started = false;
+    bool committed = false;
+    bool migrated = false;
+    char canonical_root[CBM_SZ_1K];
+    canonical_root[0] = '\0';
+
+    if (!copy_single_project_from_store(legacy_store, &stored_project) || !stored_project.name ||
+        !stored_project.root_path || !cbm_is_valid_project_root_path(stored_project.root_path) ||
+        !is_windows_absolute_root_path(stored_project.root_path)) {
+        goto cleanup;
+    }
+
+    snprintf(canonical_root, sizeof(canonical_root), "%s", stored_project.root_path);
+    cbm_canonicalize_project_root_path(canonical_root);
+
+    char *derived_project = cbm_project_name_from_path(canonical_root);
+    if (!derived_project) {
+        goto cleanup;
+    }
+    bool matches_canonical = strcmp(derived_project, canonical_project) == 0;
+    free(derived_project);
+    if (!matches_canonical) {
+        goto cleanup;
+    }
+
+    bool needs_project_rewrite = strcmp(stored_project.name, legacy_project) == 0;
+    bool already_canonical = strcmp(stored_project.name, canonical_project) == 0;
+    if (!needs_project_rewrite && !already_canonical) {
+        goto cleanup;
+    }
+
+    sqlite3 *db = cbm_store_get_db(legacy_store);
+    if (!db || cbm_store_exec(legacy_store, "PRAGMA foreign_keys = OFF;") != CBM_STORE_OK) {
+        goto cleanup;
+    }
+    if (cbm_store_begin(legacy_store) != CBM_STORE_OK) {
+        (void)cbm_store_exec(legacy_store, "PRAGMA foreign_keys = ON;");
+        goto cleanup;
+    }
+    tx_started = true;
+
+    if (needs_project_rewrite) {
+        static const char *tables[] = {
+            "nodes", "edges", "file_hashes", "project_summaries", "node_vectors", "token_vectors",
+        };
+        for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+            if (sqlite_table_exists(db, tables[i]) &&
+                sqlite_exec_project_update(db, tables[i], "project", legacy_project,
+                                           canonical_project) != CBM_STORE_OK) {
+                goto cleanup;
+            }
+        }
+        if (sqlite_update_project_identity(db, legacy_project, canonical_project, canonical_root) !=
+            CBM_STORE_OK) {
+            goto cleanup;
+        }
+    } else if (strcmp(stored_project.root_path, canonical_root) != 0 &&
+               sqlite_update_project_identity(db, canonical_project, canonical_project,
+                                              canonical_root) != CBM_STORE_OK) {
+        goto cleanup;
+    }
+
+    if (cbm_store_commit(legacy_store) != CBM_STORE_OK) {
+        goto cleanup;
+    }
+    tx_started = false;
+    committed = true;
+    (void)cbm_store_exec(legacy_store, "PRAGMA foreign_keys = ON;");
+    (void)cbm_store_checkpoint(legacy_store);
+    cbm_store_close(legacy_store);
+    legacy_store = NULL;
+
+    if (!case_alias && rename(legacy_path, canonical_path) != 0) {
+        goto cleanup;
+    }
+
+    if (!case_alias) {
+        char legacy_wal[CBM_SZ_1K];
+        char legacy_shm[CBM_SZ_1K];
+        char canonical_wal[CBM_SZ_1K];
+        char canonical_shm[CBM_SZ_1K];
+        project_db_sidecar_path(legacy_path, "-wal", legacy_wal, sizeof(legacy_wal));
+        project_db_sidecar_path(legacy_path, "-shm", legacy_shm, sizeof(legacy_shm));
+        project_db_sidecar_path(canonical_path, "-wal", canonical_wal, sizeof(canonical_wal));
+        project_db_sidecar_path(canonical_path, "-shm", canonical_shm, sizeof(canonical_shm));
+        (void)rename_path_if_exists(legacy_wal, canonical_wal);
+        (void)rename_path_if_exists(legacy_shm, canonical_shm);
+    }
+    migrated = true;
+
+cleanup:
+    if (legacy_store) {
+        if (tx_started) {
+            (void)cbm_store_rollback(legacy_store);
+        }
+        if (!committed) {
+            (void)cbm_store_exec(legacy_store, "PRAGMA foreign_keys = ON;");
+        }
+        cbm_store_close(legacy_store);
+    }
+    cbm_project_free_fields(&stored_project);
+    return migrated;
+#endif
+}
+
 /* ── Store resolution ──────────────────────────────────────────── */
 
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
-static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
-    if (!project) {
+static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, char **project_io) {
+    if (!project_io || !*project_io) {
         return NULL; /* project is required — no implicit fallback */
     }
 
+    char *project = *project_io;
+    canonicalize_windows_drive_project_name(project);
     srv->store_last_used = time(NULL);
 
     /* Already open for this project? */
@@ -713,73 +1160,50 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
      * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path_query(path);
-    if (srv->store) {
-        /* Check DB integrity — auto-clean corrupt databases */
-        if (!cbm_store_check_integrity(srv->store)) {
-            cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "deleting corrupt db — re-index required");
-            cbm_store_close(srv->store);
-            srv->store = NULL;
-            /* Delete the corrupt DB + WAL/SHM files */
-            cbm_unlink(path);
-            char wal_path[MCP_FIELD_SIZE];
-            char shm_path[MCP_FIELD_SIZE];
-            snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
-            snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-            cbm_unlink(wal_path);
-            cbm_unlink(shm_path);
-            return NULL;
-        }
-
-        /* Verify the project actually exists in this database.
-         * A .db file may exist but be empty (e.g., after delete_project on
-         * Linux where unlink defers actual removal). Opening an empty/deleted
-         * store without closing it leaks the SQLite connection. */
-        cbm_project_t proj_verify = {0};
-        if (cbm_store_get_project(srv->store, project, &proj_verify) != CBM_STORE_OK) {
-            cbm_store_close(srv->store);
-            srv->store = NULL;
-            return NULL;
-        }
-        cbm_project_free_fields(&proj_verify);
-        srv->owns_store = true;
-        free(srv->current_project);
-        srv->current_project = heap_strdup(project);
+    cbm_store_t *store = open_project_store_path(srv, project, path);
+    if (store) {
+        return store;
     }
 
-    return srv->store;
+    if (migrate_legacy_windows_cache(project, path)) {
+        return open_project_store_path(srv, project, path);
+    }
+
+    return NULL;
+}
+
+static cbm_store_t *resolve_store_const(cbm_mcp_server_t *srv, const char *project) {
+    if (!project) {
+        return NULL;
+    }
+
+    char *project_copy = heap_strdup(project);
+    if (!project_copy) {
+        return NULL;
+    }
+    cbm_store_t *store = resolve_store(srv, &project_copy);
+    free(project_copy);
+    return store;
 }
 
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
  * Returns the number of projects found. */
 static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz) {
+    cache_project_listing_t *entries = NULL;
     int count = 0;
     int offset = 0;
-    cbm_dir_t *d = cbm_opendir(dir_path);
-    if (!d) {
-        return 0;
-    }
-    cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(d)) != NULL) {
-        const char *n = entry->name;
-        size_t len = strlen(n);
-        if (len < MCP_MIN_DB_NAME || strcmp(n + len - MCP_DB_EXT, ".db") != 0) {
-            continue;
-        }
-        if (strncmp(n, "tmp-", SLEN("tmp-")) == 0 || strncmp(n, "_", SLEN("_")) == 0) {
-            continue;
-        }
-        if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
+    scan_visible_cache_projects(dir_path, &entries, &count);
+    for (int i = 0; i < count; i++) {
+        if (i > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
             out[offset++] = ',';
         }
-        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%.*s\"", (int)(len - 3), n);
+        int wrote =
+            snprintf(out + offset, out_sz - (size_t)offset, "\"%s\"", entries[i].display_name);
         if (wrote > 0) {
             offset += wrote;
         }
-        count++;
     }
-    cbm_closedir(d);
+    free(entries);
     return count;
 }
 
@@ -835,39 +1259,33 @@ static bool is_project_db_file(const char *name, size_t len) {
 
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
-static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, const struct stat *st) {
-    char project_name[CBM_SZ_1K];
-    snprintf(project_name, sizeof(project_name), "%.*s", (int)(name_len - 3), name);
-
-    char full_path[CBM_SZ_2K];
-    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
-
-    cbm_store_t *pstore = cbm_store_open_path(full_path);
+static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                                     const cache_project_listing_t *entry) {
+    cbm_store_t *pstore = cbm_store_open_path_query(entry->full_path);
     int nodes = 0;
     int edges = 0;
     char root_path_buf[CBM_SZ_1K] = "";
     if (pstore) {
-        nodes = cbm_store_count_nodes(pstore, project_name);
-        edges = cbm_store_count_edges(pstore, project_name);
         cbm_project_t proj = {0};
-        if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
+        if (copy_single_project_from_store(pstore, &proj)) {
+            const char *stored_project = proj.name ? proj.name : entry->display_name;
+            nodes = cbm_store_count_nodes(pstore, stored_project);
+            edges = cbm_store_count_edges(pstore, stored_project);
             if (proj.root_path) {
                 snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
+                cbm_canonicalize_project_root_path(root_path_buf);
             }
-            free((void *)proj.name);
-            free((void *)proj.indexed_at);
-            free((void *)proj.root_path);
+            cbm_project_free_fields(&proj);
         }
         cbm_store_close(pstore);
     }
 
     yyjson_mut_val *p = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
+    yyjson_mut_obj_add_strcpy(doc, p, "name", entry->display_name);
     yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path_buf);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
-    yyjson_mut_obj_add_int(doc, p, "size_bytes", (int64_t)st->st_size);
+    yyjson_mut_obj_add_int(doc, p, "size_bytes", (int64_t)entry->st.st_size);
     yyjson_mut_arr_add_val(arr, p);
 }
 
@@ -880,31 +1298,18 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
 
-    cbm_dir_t *d = cbm_opendir(dir_path);
-
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
 
-    if (d) {
-        cbm_dirent_t *entry;
-        while ((entry = cbm_readdir(d)) != NULL) {
-            const char *name = entry->name;
-            size_t len = strlen(name);
-            if (!is_project_db_file(name, len)) {
-                continue;
-            }
-            char full_path[CBM_SZ_2K];
-            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
-            struct stat st;
-            if (stat(full_path, &st) != 0) {
-                continue;
-            }
-            build_project_json_entry(doc, arr, dir_path, name, len, &st);
-        }
-        cbm_closedir(d);
+    cache_project_listing_t *entries = NULL;
+    int count = 0;
+    scan_visible_cache_projects(dir_path, &entries, &count);
+    for (int i = 0; i < count; i++) {
+        build_project_json_entry(doc, arr, &entries[i]);
     }
+    free(entries);
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
 
@@ -936,7 +1341,7 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
 
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
@@ -1471,7 +1876,7 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
@@ -1596,7 +2001,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
 
     if (!query) {
@@ -1667,7 +2072,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     REQUIRE_STORE(store, project);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -1769,7 +2174,7 @@ static bool aspect_wanted(yyjson_doc *aspects_doc, yyjson_val *aspects_arr, cons
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
@@ -1946,7 +2351,7 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = cbm_mcp_get_string_arg(args, "project");
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
@@ -2122,14 +2527,15 @@ static char *read_file_lines(const char *path, int start, int end) {
 
 /* ── Helper: get project root_path from store ─────────────────── */
 
-static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
-    if (!project) {
+static char *get_project_root(cbm_mcp_server_t *srv, char **project_io) {
+    if (!project_io || !*project_io) {
         return NULL;
     }
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, project_io);
     if (!store) {
         return NULL;
     }
+    const char *project = *project_io;
     cbm_project_t proj = {0};
     if (cbm_store_get_project(store, project, &proj) != CBM_STORE_OK) {
         return NULL;
@@ -2201,7 +2607,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");
 
     if (rc == 0) {
-        cbm_store_t *store = resolve_store(srv, project_name);
+        cbm_store_t *store = resolve_store(srv, &project_name);
         if (store) {
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
@@ -2376,7 +2782,8 @@ static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const cha
 static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     const char *match_method, bool include_neighbors,
                                     cbm_node_t *alternatives, int alt_count) {
-    char *root_path = get_project_root(srv, node->project);
+    char *project = node->project ? heap_strdup(node->project) : NULL;
+    char *root_path = get_project_root(srv, &project);
 
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
@@ -2464,6 +2871,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     free(root_path);
     free(abs_path);
     free(source);
+    free(project);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -2480,7 +2888,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("qualified_name is required", true);
     }
 
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
     if (!store) {
         char *_err = build_project_list_error("project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
@@ -2635,7 +3043,7 @@ static void free_indexed_file_list(char **indexed_files, int indexed_count) {
 
 static bool load_scoped_indexed_files(cbm_mcp_server_t *srv, const char *project,
                                       char ***indexed_files, int *indexed_count) {
-    cbm_store_t *pre_store = resolve_store(srv, project);
+    cbm_store_t *pre_store = resolve_store_const(srv, project);
     if (!pre_store) {
         return false;
     }
@@ -3450,7 +3858,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    char *root_path = get_project_root(srv, project);
+    char *root_path = get_project_root(srv, &project);
     if (!root_path) {
         free(pattern);
         free(project);
@@ -3532,7 +3940,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     /* Sort grep matches by file for contiguous processing.
      * Then: one SQL query per unique file for nodes, one batch query for all degrees. */
 
-    cbm_store_t *store = resolve_store(srv, project);
+    cbm_store_t *store = resolve_store(srv, &project);
 
     int sr_cap = CBM_SZ_32;
     int sr_count = 0;
@@ -3637,7 +4045,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("base_branch contains invalid characters", true);
     }
 
-    char *root_path = get_project_root(srv, project);
+    char *root_path = get_project_root(srv, &project);
     if (!root_path) {
         free(project);
         free(base_branch);
@@ -3789,7 +4197,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         mode_str = heap_strdup("get");
     }
 
-    char *root_path = get_project_root(srv, project);
+    char *root_path = get_project_root(srv, &project);
     if (!root_path) {
         free(project);
         free(mode_str);

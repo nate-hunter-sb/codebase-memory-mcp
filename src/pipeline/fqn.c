@@ -328,8 +328,8 @@ char *cbm_project_name_from_path(const char *abs_path) {
     char *path = strdup(abs_path);
     size_t len = strlen(path);
 
-    /* Normalize path separators */
-    cbm_normalize_path_sep(path);
+    /* Normalize path separators and canonicalize Windows drive letters */
+    cbm_canonicalize_project_root_path(path);
 
     /* Replace / and : with - */
     for (size_t i = 0; i < len; i++) {
