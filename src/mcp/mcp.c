@@ -600,28 +600,20 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv) {
     return srv ? srv->store : NULL;
 }
 
-static bool is_windows_drive_project_name(const char *project) {
 #ifdef _WIN32
+static bool is_windows_drive_project_name(const char *project) {
     return project && isalpha((unsigned char)project[0]) && project[1] == '-' && project[2] != '\0';
-#else
-    (void)project;
-    return false;
-#endif
 }
 
 static bool is_windows_absolute_root_path(const char *path) {
-#ifdef _WIN32
     return path && isalpha((unsigned char)path[0]) && path[1] == ':' &&
            (path[2] == '/' || path[2] == '\\');
-#else
-    (void)path;
-    return false;
-#endif
 }
+#endif
 
 static void canonicalize_windows_drive_project_name(char *project) {
 #ifdef _WIN32
-    if (is_windows_drive_project_name(project)) {
+    if (project && isalpha((unsigned char)project[0]) && project[1] == '-' && project[2] != '\0') {
         project[0] = (char)toupper((unsigned char)project[0]);
     }
 #else
@@ -634,12 +626,14 @@ static void copy_canonical_project_name(const char *project, char *out, size_t o
         return;
     }
     snprintf(out, out_sz, "%s", project ? project : "");
+#ifdef _WIN32
     canonicalize_windows_drive_project_name(out);
+#endif
 }
 
+#ifdef _WIN32
 static bool derive_windows_drive_project_variant(const char *project, char *variant,
                                                  size_t variant_sz) {
-#ifdef _WIN32
     if (!is_windows_drive_project_name(project) || !variant || variant_sz == 0) {
         return false;
     }
@@ -650,13 +644,8 @@ static bool derive_windows_drive_project_variant(const char *project, char *vari
         variant[0] = (char)toupper((unsigned char)variant[0]);
     }
     return true;
-#else
-    (void)project;
-    (void)variant;
-    (void)variant_sz;
-    return false;
-#endif
 }
+#endif
 
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     if (!srv) {
@@ -770,6 +759,7 @@ static void delete_project_db_artifacts(const char *db_path) {
     cbm_unlink(shm_path);
 }
 
+#ifdef _WIN32
 static bool rename_path_if_exists(const char *from_path, const char *to_path) {
     if (!cbm_file_exists(from_path)) {
         return true;
@@ -777,7 +767,6 @@ static bool rename_path_if_exists(const char *from_path, const char *to_path) {
     return rename(from_path, to_path) == 0;
 }
 
-#ifdef _WIN32
 static bool windows_paths_refer_to_same_file(const char *lhs, const char *rhs) {
     if (!lhs || !rhs) {
         return false;
@@ -808,7 +797,6 @@ static bool windows_paths_refer_to_same_file(const char *lhs, const char *rhs) {
     CloseHandle(left);
     return same_file;
 }
-#endif
 
 static bool sqlite_table_exists(sqlite3 *db, const char *table_name) {
     sqlite3_stmt *stmt = NULL;
@@ -852,6 +840,7 @@ static int sqlite_update_project_identity(sqlite3 *db, const char *from_project,
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
 }
+#endif
 
 static bool copy_single_project_from_store(cbm_store_t *store, cbm_project_t *out) {
     cbm_project_t *projects = NULL;

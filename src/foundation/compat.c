@@ -116,6 +116,7 @@ int cbm_temp_template(char *buf, size_t size, const char *prefix) {
     return cbm_temp_path(buf, size, leaf);
 }
 
+#ifdef _WIN32
 static int cbm_translate_tmp_template(char *dst, size_t dst_size, const char *tmpl) {
     if (!dst || dst_size == 0 || !tmpl) {
         return CBM_NOT_FOUND;
@@ -130,6 +131,7 @@ static int cbm_translate_tmp_template(char *dst, size_t dst_size, const char *tm
     }
     return 0;
 }
+#endif
 
 /* ── mkdtemp (Windows lacks it) ───────────────────────────────── */
 

@@ -5,6 +5,7 @@
  * Windows: FindFirstFile/FindNextFile, _popen/_pclose, _mkdir, _unlink.
  */
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
 #include <stdio.h>
