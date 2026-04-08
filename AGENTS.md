@@ -21,6 +21,7 @@
 - The core product is a single static binary with MCP tools for graph search, architecture, tracing, `search_code`, ADR management, and related analysis.
 - Cross-platform behavior matters. Windows fixes must not silently regress Linux or macOS behavior.
 - `search_code` is graph-augmented text search and should not depend on Unix-only assumptions on Windows.
+- For this workstation's custom Codex wrapper/upstream deployment flow, read `docs/WINDOWS_BINARY_DEPLOY.md` before concluding that a rebuilt repo binary is "live". The wrapper and installed upstream binary are separate from the repo build output.
 
 ## Repository Layout
 
