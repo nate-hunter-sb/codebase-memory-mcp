@@ -59,6 +59,7 @@
   - `search_code` with no `file_pattern`
   - `search_code` with `file_pattern`
   - `search_code` with `path_filter`
+- When Windows behavior or deployment wiring changes, keep `.codebase-memory/adr.md` and `docs/WINDOWS_BINARY_DEPLOY.md` aligned with the actual live wrapper/upstream workflow on this machine.
 
 # Deletion Policy
 
