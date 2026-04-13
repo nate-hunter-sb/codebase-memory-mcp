@@ -2503,7 +2503,9 @@ static int cbm_kill_other_instances(void) {
  * Returns: 0 = verified OK, 1 = mismatch (FAIL), -1 = could not verify (warning). */
 static int verify_download_checksum(const char *archive_path, const char *archive_name) {
     char checksum_file[CLI_BUF_256];
-    snprintf(checksum_file, sizeof(checksum_file), "%s/cbm-checksums.txt", cbm_tmpdir());
+    if (cbm_temp_path(checksum_file, sizeof(checksum_file), "cbm-checksums.txt") != 0) {
+        return -1;
+    }
 
     char dl_base_buf[CLI_BUF_512];
     const char *dl_base =
@@ -3238,7 +3240,18 @@ static int update_clear_indexes(const char *home, bool dry_run) {
 static int download_verify_install(const char *url, const char *ext, const char *os,
                                    const char *arch, bool want_ui, const char *bin_dest) {
     char tmp_archive[CLI_BUF_256];
-    snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update.%s", cbm_tmpdir(), ext);
+    char tmp_leaf[CLI_BUF_128];
+    int tmp_leaf_written;
+
+    tmp_leaf_written = snprintf(tmp_leaf, sizeof(tmp_leaf), "cbm-update.%s", ext);
+    if (tmp_leaf_written < 0 || (size_t)tmp_leaf_written >= sizeof(tmp_leaf)) {
+        (void)fprintf(stderr, "error: temp archive name is too long\n");
+        return CLI_TRUE;
+    }
+    if (cbm_temp_path(tmp_archive, sizeof(tmp_archive), tmp_leaf) != 0) {
+        (void)fprintf(stderr, "error: could not build temporary archive path\n");
+        return CLI_TRUE;
+    }
 
     int rc = cbm_download_to_file(url, tmp_archive);
     if (rc != 0) {

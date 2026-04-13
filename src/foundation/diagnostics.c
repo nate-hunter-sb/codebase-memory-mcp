@@ -176,9 +176,16 @@ bool cbm_diag_start(void) {
 
     g_start_time = time(NULL);
     atomic_store(&g_diag_stop, 0);
+    char diag_leaf[CBM_SZ_64];
+    int diag_leaf_written;
 
-    snprintf(g_diag_path, sizeof(g_diag_path), "%s/cbm-diagnostics-%d.json", cbm_tmpdir(),
-             (int)getpid());
+    diag_leaf_written = snprintf(diag_leaf, sizeof(diag_leaf), "cbm-diagnostics-%d.json", (int)getpid());
+    if (diag_leaf_written < 0 || (size_t)diag_leaf_written >= sizeof(diag_leaf)) {
+        return false;
+    }
+    if (cbm_temp_path(g_diag_path, sizeof(g_diag_path), diag_leaf) != 0) {
+        return false;
+    }
 
     if (cbm_thread_create(&g_diag_thread, 0, diag_thread_fn, NULL) != 0) {
         return false;

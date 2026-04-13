@@ -17,6 +17,7 @@
 #include "mcp/mcp.h"
 #include "store/store.h"
 /* pipeline.h no longer needed — indexing runs as subprocess */
+#include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -126,7 +127,14 @@ static bool get_query_param(struct mg_str query, const char *name, char *buf, in
 static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
     const char *dir = cbm_resolve_cache_dir();
     if (!dir) {
-        dir = cbm_tmpdir();
+        char leaf[CBM_PATH_MAX];
+        int leaf_written = snprintf(leaf, sizeof(leaf), "%s.db", project);
+        if (leaf_written < 0 || (size_t)leaf_written >= sizeof(leaf) || cbm_temp_path(buf, bufsz, leaf) != 0) {
+            if (bufsz > 0) {
+                buf[0] = '\0';
+            }
+        }
+        return;
     }
     snprintf(buf, bufsz, "%s/%s.db", dir, project);
 }

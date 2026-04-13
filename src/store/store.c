@@ -655,15 +655,21 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
 }
 
 cbm_store_t *cbm_store_open(const char *project) {
+    char path[CBM_SZ_1K];
+
     if (!project) {
         return NULL;
     }
     const char *cdir = cbm_resolve_cache_dir();
     if (!cdir) {
-        cdir = cbm_tmpdir();
+        char leaf[CBM_SZ_1K];
+        int leaf_written = snprintf(leaf, sizeof(leaf), "%s.db", project);
+        if (leaf_written < 0 || (size_t)leaf_written >= sizeof(leaf) || cbm_temp_path(path, sizeof(path), leaf) != 0) {
+            return NULL;
+        }
+    } else {
+        snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
     }
-    char path[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
     return store_open_internal(path, false);
 }
 

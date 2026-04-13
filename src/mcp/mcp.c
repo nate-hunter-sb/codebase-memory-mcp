@@ -720,18 +720,42 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 /* Returns the cache directory. Writes to buf, returns buf for convenience. */
 static const char *cache_dir(char *buf, size_t bufsz) {
     const char *dir = cbm_resolve_cache_dir();
-    if (!dir) {
-        dir = cbm_tmpdir();
+    if (dir) {
+        snprintf(buf, bufsz, "%s", dir);
+        return buf;
     }
-    snprintf(buf, bufsz, "%s", dir);
+    if (cbm_get_tmpdir(buf, bufsz) != 0) {
+        snprintf(buf, bufsz, "%s", ".");
+    }
     return buf;
 }
 
 /* Returns full .db path for a project: <cache_dir>/<project>.db */
 static const char *project_db_path(const char *project, char *buf, size_t bufsz) {
-    char dir[CBM_SZ_1K];
-    cache_dir(dir, sizeof(dir));
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir) {
+        char leaf[CBM_SZ_1K];
+        int leaf_written = snprintf(leaf, sizeof(leaf), "%s.db", project);
+        if (leaf_written < 0 || (size_t)leaf_written >= sizeof(leaf) || cbm_temp_path(buf, bufsz, leaf) != 0) {
+            if (bufsz > 0) {
+                buf[0] = '\0';
+            }
+            return buf;
+        }
+        return buf;
+    }
+    size_t dir_len = strlen(dir);
+    size_t project_len = strlen(project);
+    if (dir_len + project_len + 4 > bufsz) {
+        if (bufsz > 0) {
+            buf[0] = '\0';
+        }
+        return buf;
+    }
+    memcpy(buf, dir, dir_len);
+    buf[dir_len] = '/';
+    memcpy(buf + dir_len + 1, project, project_len);
+    memcpy(buf + dir_len + 1 + project_len, ".db", 4);
     return buf;
 }
 
