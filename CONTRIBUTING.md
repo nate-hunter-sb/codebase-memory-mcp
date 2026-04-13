@@ -6,7 +6,7 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 
 ## Build from Source
 
-**Prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).
+**Prerequisites**: C compiler (gcc or clang), make-compatible build runner, zlib, Git. Optional: Node.js 22+ (for graph UI).
 
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
@@ -14,6 +14,8 @@ cd codebase-memory-mcp
 git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
 ```
+
+On Windows, the repo-local scripts remain the primary contract, but local shells may expose `mingw32-make` instead of `make`. If that happens, document the exact invocation used for validation in your PR notes instead of silently skipping verification.
 
 macOS: `xcode-select --install` provides clang.
 Linux: `sudo apt install build-essential zlib1g-dev` (Debian/Ubuntu) or `sudo dnf install gcc zlib-devel` (Fedora).
@@ -154,10 +156,12 @@ If in doubt, open an issue and ask.
 Changes that touch `search_code` or any other shell-backed search path must preserve native Windows behavior.
 
 - Do not hardcode `/tmp` or other POSIX-only temp paths. Use the platform temp helpers already provided by the codebase and delete temporary files on every exit path.
+- Prefer `cbm_get_tmpdir()`, `cbm_temp_path()`, and `cbm_temp_template()` when callers need owned storage for a temp-backed path. Use `cbm_mkstemp()` and related helpers for temporary file creation rather than rebuilding paths ad hoc.
 - Treat `project`, resolved root paths, and `file_pattern` as shell-facing input. Validate them before execution instead of interpolating unchecked values into command strings.
 - Keep Windows execution native. Do not introduce new mandatory dependencies on GNU `grep`, `xargs`, MSYS2, Git Bash, or Cygwin just to make search work.
 - Preserve the current search contract: scope to indexed files when possible, then fall back to a recursive project-root search when scoped execution is unavailable.
 - If you change the search backend, update [docs/WINDOWS_SEARCH.md](docs/WINDOWS_SEARCH.md) in the same PR so user-visible behavior and maintainer expectations stay aligned.
+- If you create or retain archived worktrees or review snapshots under repo-root `Safe to Delete/`, keep `.gitignore` and `.cgrignore` aligned so they stay out of both indexing and staging.
 
 ## Security
 

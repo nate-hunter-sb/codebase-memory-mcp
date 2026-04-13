@@ -13,6 +13,7 @@
 - Prefer `codebase-memory` once the repo is indexed and bound.
 - Start by checking `codebase-memory` scope with `index_status`; call `set_session_project` only when the session project is unset or incorrect.
 - Keep `.cgrignore` current when repo-local caches, generated outputs, vendored mirrors, copied release artifacts, or archived worktrees change so indexing stays focused on active source and docs.
+- Keep `.gitignore` aligned with the same local-only archive and generated-state areas so archived worktrees under `Safe to Delete/` do not become staging noise.
 - If shell search is needed, scope it to this repo and prefer PowerShell-native commands or `rg`.
 
 ## Project Intent
@@ -41,6 +42,7 @@
 
 - Keep platform-specific behavior localized to explicit compatibility helpers or clear `_WIN32` branches.
 - Prefer native/internal execution over shell-string composition when adding or fixing Windows support.
+- Prefer `cbm_get_tmpdir()`, `cbm_temp_path()`, and `cbm_temp_template()` when callers need owned temp-path storage for path construction.
 - Do not change MCP tool names, defaults, or schemas without explicit approval.
 - Avoid adding new dependencies unless explicitly approved.
 - Keep README, docs, and tests aligned with actual behavior.

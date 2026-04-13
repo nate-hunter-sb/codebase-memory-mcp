@@ -36,7 +36,7 @@ The Windows fix does not remove every search constraint. These limits still appl
 
 If you touch the `search_code` path, keep these rules intact:
 
-- Use platform temp helpers such as `cbm_tmpdir()` and `cbm_mkstemp()` or an equivalent cross-platform abstraction. Do not reintroduce hardcoded POSIX temp paths.
+- Use platform temp helpers such as `cbm_get_tmpdir()`, `cbm_temp_path()`, `cbm_temp_template()`, and `cbm_mkstemp()` or an equivalent cross-platform abstraction. Prefer caller-owned temp-path storage when building paths that may be reused across threads. Do not reintroduce hardcoded POSIX temp paths.
 - Validate any value that will reach a shell command or backend process. Today that includes the resolved project root and `file_pattern`, and the same rule applies to future shell-facing inputs.
 - Prefer passing search data through temp files or explicit arguments instead of embedding raw user patterns directly into command strings.
 - Keep cleanup symmetric. Temporary files created for pattern passing or scoped file lists must be removed on all return paths, including backend startup failures.
@@ -48,8 +48,8 @@ If you touch the `search_code` path, keep these rules intact:
 When reviewing or updating the implementation, these are the code paths that define the current contract:
 
 - `src/mcp/mcp.c`: `handle_search_code`, `validate_search_args`, `write_pattern_file`, `write_scoped_filelist`, `build_grep_cmd`
-- `src/foundation/compat.h`: `cbm_tmpdir`
-- `src/foundation/compat.c`: `cbm_mkstemp`
+- `src/foundation/compat.h`: temp-path helper declarations
+- `src/foundation/compat.c`: `cbm_get_tmpdir`, `cbm_temp_path`, `cbm_temp_template`, `cbm_mkstemp`
 - `src/foundation/str_util.c`: `cbm_validate_shell_arg`
 
 If those touchpoints change, keep this document synchronized with the merged behavior.
