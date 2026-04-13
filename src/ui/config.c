@@ -23,7 +23,10 @@
 void cbm_ui_config_path(char *buf, int bufsz) {
     const char *dir = cbm_resolve_cache_dir();
     if (!dir) {
-        dir = cbm_tmpdir();
+        if (cbm_temp_path(buf, (size_t)bufsz, "config.json") != 0 && bufsz > 0) {
+            buf[0] = '\0';
+        }
+        return;
     }
     snprintf(buf, (size_t)bufsz, "%s/config.json", dir);
 }

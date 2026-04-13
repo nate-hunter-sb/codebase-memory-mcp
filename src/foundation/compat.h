@@ -146,6 +146,7 @@ static inline int cbm_unsetenv(const char *name) {
 #endif
 
 /* ── Temp directory helper ───────────────────────────────────── */
+/* Prefer cbm_get_tmpdir() when the caller needs owned storage for path building. */
 const char *cbm_tmpdir(void);
 
 /* ── Signal handling ──────────────────────────────────────────── */

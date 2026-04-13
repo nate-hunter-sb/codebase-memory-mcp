@@ -621,9 +621,15 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     } else {
         const char *cdir = cbm_resolve_cache_dir();
         if (!cdir) {
-            cdir = cbm_tmpdir();
+            char db_leaf[CBM_SZ_1K];
+            int db_leaf_written = snprintf(db_leaf, sizeof(db_leaf), "%s.db", p->project_name);
+            if (db_leaf_written < 0 || (size_t)db_leaf_written >= sizeof(db_leaf) ||
+                cbm_temp_path(db_path, sizeof(db_path), db_leaf) != 0) {
+                return CBM_NOT_FOUND;
+            }
+        } else {
+            snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, p->project_name);
         }
-        snprintf(db_path, sizeof(db_path), "%s/%s.db", cdir, p->project_name);
     }
     char db_dir[CBM_SZ_1K];
     snprintf(db_dir, sizeof(db_dir), "%s", db_path);
