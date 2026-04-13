@@ -20,6 +20,29 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
   <em>Built-in 3D graph visualization (UI variant) — explore your knowledge graph at localhost:9749</em>
 </p>
 
+For maintainer context and handoff notes, see [CONTEXT.md](CONTEXT.md). For deeper implementation boundaries, see [docs/architecture.md](docs/architecture.md). For contribution workflow, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Table of Contents
+
+- [Why codebase-memory-mcp](#why-codebase-memory-mcp)
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [How It Works](#how-it-works)
+- [Performance](#performance)
+- [Installation](#installation)
+- [Multi-Agent Support](#multi-agent-support)
+- [CLI Mode](#cli-mode)
+- [MCP Tools](#mcp-tools)
+- [Graph Data Model](#graph-data-model)
+- [Ignoring Files](#ignoring-files)
+- [Configuration](#configuration)
+- [Custom File Extensions](#custom-file-extensions)
+- [Persistence](#persistence)
+- [Troubleshooting](#troubleshooting)
+- [Language Support](#language-support)
+- [Architecture](#architecture)
+- [License](#license)
+
 ## Why codebase-memory-mcp
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
@@ -304,16 +327,11 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `get_graph_schema` | Node/edge counts, relationship patterns. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
-| `search_code` | Grep-like text search within indexed project files. See `docs/WINDOWS_SEARCH.md` for the Windows fix contract and platform notes. |
+| `search_code` | Grep-like text search within indexed project files. See `docs/WINDOWS_SEARCH.md` for platform-specific notes. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
 
-### Windows `search_code`
-
-The repo is tracking a paired Windows `search_code` fix for the previous POSIX-only assumptions around `/tmp`, `grep`, and `xargs`.
-
-- The intended merged behavior is documented in [docs/WINDOWS_SEARCH.md](docs/WINDOWS_SEARCH.md).
-- That note also records the platform limitations that remain after the fix and the maintainer rules for temp files, path validation, and search execution.
+Platform-specific maintainer notes for `search_code`, especially on Windows, live in [docs/WINDOWS_SEARCH.md](docs/WINDOWS_SEARCH.md).
 
 ## Graph Data Model
 
@@ -405,6 +423,8 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 Plus: Clojure, F#, Julia, Vim Script, Nix, Common Lisp, Elm, Fortran, CUDA, COBOL, Verilog, Emacs Lisp, MATLAB, Lean 4, FORM, Magma, Wolfram, JSON, XML, Markdown, Makefile, CMake, Protobuf, GraphQL, Vue, Svelte, Meson, GLSL, INI.
 
 ## Architecture
+
+For a more detailed maintainer-facing architecture walkthrough, see [docs/architecture.md](docs/architecture.md).
 
 ```
 src/
