@@ -257,10 +257,9 @@ typedef struct {
 } tool_def_t;
 
 #define CBM_TOOL_SLOT_COUNT 15   /* update when TOOLS[] grows */
-#define CBM_TOOL_NAME_LEN   64
 
 typedef struct {
-    char         name[CBM_TOOL_NAME_LEN];
+    char         name[CBM_SZ_64];
     atomic_int   calls;
     atomic_int   errors;
     atomic_llong input_bytes;
@@ -270,6 +269,8 @@ typedef struct {
 
 static cbm_tool_stats_t g_tool_stats[CBM_TOOL_SLOT_COUNT];
 static atomic_bool      g_tool_stats_ready = false;
+static cbm_mutex_t      g_stats_mtx;
+static _Atomic int      g_stats_mtx_init  = 0;
 
 static const tool_def_t TOOLS[] = {
     {"index_repository", "Index a repository into the knowledge graph",
@@ -412,15 +413,35 @@ static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 _Static_assert(CBM_TOOL_SLOT_COUNT == sizeof(TOOLS) / sizeof(TOOLS[0]),
                "CBM_TOOL_SLOT_COUNT out of sync with TOOLS[]");
 
+/* Bootstrap g_stats_mtx exactly once using CAS (same pattern as semantic.c). */
+static void ensure_stats_mutex(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&g_stats_mtx_init, &expected,
+                                                1, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        cbm_mutex_init(&g_stats_mtx);
+        atomic_store_explicit(&g_stats_mtx_init, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&g_stats_mtx_init, memory_order_acquire) != 2) { /* spin */ }
+    }
+}
+
 static void ensure_tool_stats_init(void) {
     if (atomic_load_explicit(&g_tool_stats_ready, memory_order_acquire)) return;
-    for (int i = 0; i < TOOL_COUNT; i++) {
-        snprintf(g_tool_stats[i].name, CBM_TOOL_NAME_LEN, "%s", TOOLS[i].name);
+    ensure_stats_mutex();
+    cbm_mutex_lock(&g_stats_mtx);
+    if (!atomic_load_explicit(&g_tool_stats_ready, memory_order_relaxed)) {
+        for (int i = 0; i < TOOL_COUNT; i++) {
+            snprintf(g_tool_stats[i].name, CBM_SZ_64, "%s", TOOLS[i].name);
+        }
+        atomic_store_explicit(&g_tool_stats_ready, true, memory_order_release);
     }
-    atomic_store_explicit(&g_tool_stats_ready, true, memory_order_release);
+    cbm_mutex_unlock(&g_stats_mtx);
 }
 
 void cbm_tool_stats_reset(void) {
+    ensure_stats_mutex();
+    cbm_mutex_lock(&g_stats_mtx);
     for (int i = 0; i < TOOL_COUNT; i++) {
         atomic_store(&g_tool_stats[i].calls,        0);
         atomic_store(&g_tool_stats[i].errors,       0);
@@ -429,6 +450,7 @@ void cbm_tool_stats_reset(void) {
         atomic_store(&g_tool_stats[i].time_us,      0LL);
     }
     atomic_store_explicit(&g_tool_stats_ready, false, memory_order_release);
+    cbm_mutex_unlock(&g_stats_mtx);
 }
 
 static void record_tool_stats(const char *tool_name, long long input_bytes,
