@@ -2531,6 +2531,53 @@ TEST(mcp_server_run_rapid_messages) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+/* ══════════════════════════════════════════════════════════════════
+ *  SHOW TOKEN SAVINGS
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(show_token_savings_empty) {
+    cbm_tool_stats_reset();
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"show_token_savings\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"total_calls\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "\"by_tool\":[]"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(show_token_savings_after_calls) {
+    cbm_tool_stats_reset();
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *r1 = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    free(r1);
+    char *r2 = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    free(r2);
+
+    char *resp = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"show_token_savings\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"list_projects\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"total_calls\":3"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 SUITE(mcp) {
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
@@ -2624,6 +2671,10 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
+
+    /* Token savings reporting */
+    RUN_TEST(show_token_savings_empty);
+    RUN_TEST(show_token_savings_after_calls);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);

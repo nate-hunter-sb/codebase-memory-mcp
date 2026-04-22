@@ -256,6 +256,21 @@ typedef struct {
     const char *input_schema; /* JSON string */
 } tool_def_t;
 
+#define CBM_TOOL_SLOT_COUNT 15   /* update when TOOLS[] grows */
+#define CBM_TOOL_NAME_LEN   64
+
+typedef struct {
+    char         name[CBM_TOOL_NAME_LEN];
+    atomic_int   calls;
+    atomic_int   errors;
+    atomic_llong input_bytes;
+    atomic_llong output_bytes;
+    atomic_llong time_us;
+} cbm_tool_stats_t;
+
+static cbm_tool_stats_t g_tool_stats[CBM_TOOL_SLOT_COUNT];
+static bool             g_tool_stats_ready = false;
+
 static const tool_def_t TOOLS[] = {
     {"index_repository", "Index a repository into the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
@@ -386,9 +401,51 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"show_token_savings",
+     "Report per-tool call counts and estimated input/output token volumes for this server session.",
+     "{\"type\":\"object\",\"properties\":{}}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
+
+_Static_assert(CBM_TOOL_SLOT_COUNT == sizeof(TOOLS) / sizeof(TOOLS[0]),
+               "CBM_TOOL_SLOT_COUNT out of sync with TOOLS[]");
+
+static void ensure_tool_stats_init(void) {
+    if (g_tool_stats_ready) return;
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        snprintf(g_tool_stats[i].name, CBM_TOOL_NAME_LEN, "%s", TOOLS[i].name);
+    }
+    g_tool_stats_ready = true;
+}
+
+void cbm_tool_stats_reset(void) {
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        atomic_store(&g_tool_stats[i].calls,        0);
+        atomic_store(&g_tool_stats[i].errors,       0);
+        atomic_store(&g_tool_stats[i].input_bytes,  0LL);
+        atomic_store(&g_tool_stats[i].output_bytes, 0LL);
+        atomic_store(&g_tool_stats[i].time_us,      0LL);
+    }
+    g_tool_stats_ready = false;
+}
+
+static void record_tool_stats(const char *tool_name, long long input_bytes,
+                               long long output_bytes, long long dur_us,
+                               bool is_error) {
+    ensure_tool_stats_init();
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(g_tool_stats[i].name, tool_name) == 0) {
+            atomic_fetch_add(&g_tool_stats[i].calls,        1);
+            atomic_fetch_add(&g_tool_stats[i].input_bytes,  input_bytes);
+            atomic_fetch_add(&g_tool_stats[i].output_bytes, output_bytes);
+            atomic_fetch_add(&g_tool_stats[i].time_us,      dur_us);
+            if (is_error) atomic_fetch_add(&g_tool_stats[i].errors, 1);
+            return;
+        }
+    }
+}
 
 char *cbm_mcp_tools_list(void) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -4293,6 +4350,58 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
+static char *handle_show_token_savings(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    (void)args;
+    ensure_tool_stats_init();
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    long long total_calls = 0, total_errors = 0;
+    long long total_in_bytes = 0, total_out_bytes = 0;
+    yyjson_mut_val *tools_arr = yyjson_mut_arr(doc);
+
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        cbm_tool_stats_t *s = &g_tool_stats[i];
+        long long calls = (long long)atomic_load(&s->calls);
+        if (calls == 0) continue;
+
+        long long in_b  = (long long)atomic_load(&s->input_bytes);
+        long long out_b = (long long)atomic_load(&s->output_bytes);
+        long long errs  = (long long)atomic_load(&s->errors);
+
+        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, entry, "tool",          s->name);
+        yyjson_mut_obj_add_int(doc, entry, "calls",         (int64_t)calls);
+        yyjson_mut_obj_add_int(doc, entry, "errors",        (int64_t)errs);
+        yyjson_mut_obj_add_int(doc, entry, "input_tokens",  (int64_t)((in_b  + 3) / 4));
+        yyjson_mut_obj_add_int(doc, entry, "output_tokens", (int64_t)((out_b + 3) / 4));
+        yyjson_mut_arr_append(tools_arr, entry);
+
+        total_calls     += calls;
+        total_errors    += errs;
+        total_in_bytes  += in_b;
+        total_out_bytes += out_b;
+    }
+
+    yyjson_mut_obj_add_int(doc, root, "total_calls",         (int64_t)total_calls);
+    yyjson_mut_obj_add_int(doc, root, "total_errors",        (int64_t)total_errors);
+    yyjson_mut_obj_add_int(doc, root, "total_input_tokens",  (int64_t)((total_in_bytes  + 3) / 4));
+    yyjson_mut_obj_add_int(doc, root, "total_output_tokens", (int64_t)((total_out_bytes + 3) / 4));
+    yyjson_mut_obj_add_val(doc, root, "by_tool",             tools_arr);
+    yyjson_mut_obj_add_str(doc, root, "note",
+        "Token estimates: bytes / 4 (ceiling). Input = args JSON size. "
+        "Output = tool response size before update-notice injection.");
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
@@ -4341,6 +4450,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "show_token_savings") == 0) {
+        return handle_show_token_savings(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
@@ -4641,6 +4753,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
 
+        long long input_bytes = (long long)strlen(tool_args);
         struct timespec t0;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
         result_json = cbm_mcp_handle_tool(srv, tool_name, tool_args);
@@ -4649,7 +4762,9 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - t0.tv_nsec) / MCP_MS_TO_US);
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
+        long long output_bytes = result_json ? (long long)strlen(result_json) : 0LL;
         cbm_diag_record_query(dur_us, is_err);
+        if (tool_name) record_tool_stats(tool_name, input_bytes, output_bytes, dur_us, is_err);
 
         result_json = inject_update_notice(srv, result_json);
         free(tool_name);

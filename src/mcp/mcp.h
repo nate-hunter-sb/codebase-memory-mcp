@@ -55,6 +55,9 @@ char *cbm_mcp_text_result(const char *text, bool is_error);
 /* Format the tools/list response. Returns heap-allocated JSON. */
 char *cbm_mcp_tools_list(void);
 
+/* Reset per-tool call stats to zero. Called by tests to clear global state. */
+void cbm_tool_stats_reset(void);
+
 /* Format the initialize response. params_json is the raw initialize params
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);
