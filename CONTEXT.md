@@ -8,7 +8,7 @@ Use this file when you need to understand what the repo is, what matters right n
 
 ## Purpose
 
-`codebase-memory-mcp` is a pure C MCP server for structural code intelligence. It indexes repositories into a persistent graph and exposes MCP tools for search, architecture, tracing, impact analysis, ADR management, and graph queries.
+`codebase-memory-mcp` is a pure C MCP server for structural code intelligence. It indexes repositories into a persistent graph and exposes MCP tools for search, architecture, tracing, impact analysis, ADR management, graph queries, and session-level token savings reporting.
 
 ## Current Product Shape
 
