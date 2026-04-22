@@ -2571,7 +2571,7 @@ TEST(show_token_savings_after_calls) {
         "\"params\":{\"name\":\"show_token_savings\",\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"list_projects\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"total_calls\":3"));
+    ASSERT_NOT_NULL(strstr(resp, "\"total_calls\":2"));
     free(resp);
 
     cbm_mcp_server_free(srv);

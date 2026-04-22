@@ -269,7 +269,7 @@ typedef struct {
 } cbm_tool_stats_t;
 
 static cbm_tool_stats_t g_tool_stats[CBM_TOOL_SLOT_COUNT];
-static bool             g_tool_stats_ready = false;
+static atomic_bool      g_tool_stats_ready = false;
 
 static const tool_def_t TOOLS[] = {
     {"index_repository", "Index a repository into the knowledge graph",
@@ -413,11 +413,11 @@ _Static_assert(CBM_TOOL_SLOT_COUNT == sizeof(TOOLS) / sizeof(TOOLS[0]),
                "CBM_TOOL_SLOT_COUNT out of sync with TOOLS[]");
 
 static void ensure_tool_stats_init(void) {
-    if (g_tool_stats_ready) return;
+    if (atomic_load_explicit(&g_tool_stats_ready, memory_order_acquire)) return;
     for (int i = 0; i < TOOL_COUNT; i++) {
         snprintf(g_tool_stats[i].name, CBM_TOOL_NAME_LEN, "%s", TOOLS[i].name);
     }
-    g_tool_stats_ready = true;
+    atomic_store_explicit(&g_tool_stats_ready, true, memory_order_release);
 }
 
 void cbm_tool_stats_reset(void) {
@@ -428,7 +428,7 @@ void cbm_tool_stats_reset(void) {
         atomic_store(&g_tool_stats[i].output_bytes, 0LL);
         atomic_store(&g_tool_stats[i].time_us,      0LL);
     }
-    g_tool_stats_ready = false;
+    atomic_store_explicit(&g_tool_stats_ready, false, memory_order_release);
 }
 
 static void record_tool_stats(const char *tool_name, long long input_bytes,
@@ -4393,7 +4393,8 @@ static char *handle_show_token_savings(cbm_mcp_server_t *srv, const char *args) 
     yyjson_mut_obj_add_val(doc, root, "by_tool",             tools_arr);
     yyjson_mut_obj_add_str(doc, root, "note",
         "Token estimates: bytes / 4 (ceiling). Input = args JSON size. "
-        "Output = tool response size before update-notice injection.");
+        "Output = tool response size before update-notice injection. "
+        "Stats are process-wide (stdio + HTTP); this call is not included in the totals.");
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
