@@ -27,6 +27,13 @@ Keep the repository friendly for local maintainer workflows on this workstation:
 - Finish tightening Windows-safe temp-path usage anywhere shell-backed or filesystem-backed helper flows still assume implicit shared path storage.
 - Continue reducing `-Werror` warning backlog so focused fixes can be validated with full local builds more reliably.
 - Keep `docs/WINDOWS_SEARCH.md` and `docs/WINDOWS_BINARY_DEPLOY.md` synchronized with the merged implementation and local deployment workflow.
+- Improve agent-facing MCP trust and query ergonomics so structural answers are easier to trust during active coding:
+  - add explicit freshness metadata to query results where practical, including last index/update time, whether the underlying file changed since the indexed snapshot, and the repo revision or cache basis when available
+  - make search/trace/architecture results more source-backed by default with exact file paths, line references, and small raw snippets so agents can jump from graph answers to current source truth faster
+  - add tighter scoped query controls for common agent workflows such as current folder/module, production-code-only filtering, and explicit exclusion of tests, docs, vendored code, generated output, runtime artifacts, or archived worktrees
+  - improve ranking so likely implementation files and current-source hits beat docs, stale artifacts, generated files, vendored trees, or archived local state when multiple matches are possible
+  - add a focused "likely edit surface" or equivalent impact-oriented query mode that returns the small set of files/symbols most likely to matter for a requested change instead of broad graph result sets
+  - tighten incremental reindex/update behavior so post-edit graph answers stay trustworthy during active coding sessions and clearly report when the graph may be stale
 
 ## Notable Non-Goals
 
