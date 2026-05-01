@@ -3,8 +3,8 @@
 Claude-facing tactical context. Codex-facing routing stays in `AGENTS.md` and `CONTEXT.md`.
 
 Open-source C MCP server — 15 MCP tools over a SQLite knowledge graph, tree-sitter AST
-extraction, and semantic embeddings. Core files: `src/mcp/mcp.c` (~5100 lines),
-`src/store/store.c` (~5000 lines), `tests/test_mcp.c` (~2890 lines).
+extraction, and semantic embeddings. Core files: `src/mcp/mcp.c` (~5160 lines),
+`src/store/store.c` (~5000 lines), `tests/test_mcp.c` (~2903 lines).
 
 Always use `cstol_read` for these files; never plain `Read`.
 
@@ -51,7 +51,7 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
 
 | Symbol | Location | Notes |
 |--------|----------|-------|
-| `handle_get_code_snippet` | `src/mcp/mcp.c:2989` | QN path + file+line path |
+| `handle_get_code_snippet` | `src/mcp/mcp.c:2987` | QN path + file+line path |
 | `resolve_snippet_source` | `src/mcp/mcp.c:2842` | Root containment check then `read_file_lines` |
 | `build_snippet_response` | `src/mcp/mcp.c:~2887` | Builds JSON for indexed nodes |
 | `load_scoped_indexed_files` | `src/mcp/mcp.c:~3262` | Wraps `cbm_store_list_files`; static — defined late |
@@ -64,7 +64,7 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
 
 ## C gotchas
 
-- **Static function ordering** — `mcp.c` is ~5100 lines processed top-to-bottom. If a
+- **Static function ordering** — `mcp.c` is ~5160 lines processed top-to-bottom. If a
   static function is defined at line N, you cannot call it from line M < N. Inline the
   logic or restructure. The `free_indexed_file_list` / `load_scoped_indexed_files` cluster
   lives at ~line 3252.
@@ -76,10 +76,13 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
   may be freed before serialization.
 - **`cbm_mcp_get_int_arg` returns 0 for missing** — distinguish "not provided" (0) from
   "provided as 0" (also 0) by checking both args at once in validation logic.
+- **No top-level `anyOf`/`allOf`/`oneOf` in tool schemas** — Claude's tool validator rejects
+  these with HTTP 400, poisoning the full tool list. Express mutual-exclusion constraints in
+  the handler; keep `required` flat (e.g. `["project"]` only).
 
 ---
 
-## Snippet tool (file+line path) — added v0.10.0, hardened v0.10.1
+## Snippet tool (file+line path) — added v0.10.0, hardened v0.10.1, schema fixed v0.10.2
 
 `get_code_snippet` accepts `(file, start_line, end_line)` as an alternative to
 `qualified_name`. Dispatch:
@@ -91,7 +94,7 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
 
 ## Version
 
-Current: `0.10.1`
+Current: `0.10.2`
 
 ## ADR
 

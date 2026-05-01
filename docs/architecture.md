@@ -34,6 +34,7 @@ At a high level, the runtime separates into four layers:
 - Keep temp-path and shell-facing behavior platform-safe. Prefer the temp helpers in `src/foundation/compat.*` and validate inputs before they reach backend execution.
 - Keep file-backed MCP reads scoped to the indexed project surface unless a deliberate, reviewed API change approves broader filesystem access.
 - Keep MCP tool names, defaults, and payload contracts stable unless a deliberate API change is approved.
+- Keep MCP tool input schemas free of top-level `anyOf`/`allOf`/`oneOf` — agent validators reject these at the schema level, poisoning the full tool list. Enforce mutual-exclusion constraints in the handler instead.
 - Keep Windows deployment concerns separate from repo build concerns. Repo build output does not automatically replace the installed upstream binary used by local wrappers.
 - Keep ignore-file policy aligned with the local workflow: `.cgrignore` for indexing focus and `.gitignore` for staging hygiene.
 

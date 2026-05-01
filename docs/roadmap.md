@@ -12,6 +12,8 @@ Preserve the current MCP tool surface while improving correctness, performance, 
 
 Security-sensitive read paths such as `get_code_snippet` file+line fallback should stay constrained to the indexed project surface.
 
+MCP tool input schemas must remain compatible with agent-side schema validators — no top-level `anyOf`/`allOf`/`oneOf`. (v0.10.2: removed `anyOf` from `get_code_snippet` inputSchema; constraint now enforced in handler.)
+
 ### 3. Indexing and Search Performance
 
 Continue improving indexing throughput, graph persistence efficiency, and targeted search behavior without trading away cross-platform correctness.

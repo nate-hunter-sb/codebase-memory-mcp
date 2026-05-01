@@ -1,4 +1,5 @@
 /* Version: 0.10.1 */
+// Version: 0.10.2
 /*
  * test_mcp.c — Tests for the MCP server module.
  *
@@ -178,6 +179,19 @@ TEST(mcp_tools_array_schemas_have_items) {
         p = end;
     }
 
+    free(json);
+    PASS();
+}
+
+TEST(mcp_tools_no_top_level_anyof) {
+    /* Claude's tool validator rejects anyOf/allOf/oneOf at the top level of
+     * a custom tool inputSchema — causes HTTP 400 and poisons the full tool
+     * list. Assert none of these keywords appear in our schemas. */
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "\"anyOf\""));
+    ASSERT_NULL(strstr(json, "\"allOf\""));
+    ASSERT_NULL(strstr(json, "\"oneOf\""));
     free(json);
     PASS();
 }
@@ -2769,6 +2783,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_array_schemas_have_items);
+    RUN_TEST(mcp_tools_no_top_level_anyof);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_error);
 

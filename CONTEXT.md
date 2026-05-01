@@ -36,6 +36,7 @@ Use this file when you need to understand what the repo is, what matters right n
 
 - Preserve native Windows reliability across temp paths, search execution, cache identity, and local deployment.
 - Keep MCP tool contracts stable while improving correctness and performance behind the existing interfaces.
+- Keep MCP tool inputSchema contracts compatible with all supported agent validators: no top-level `anyOf`/`allOf`/`oneOf` (causes HTTP 400 that poisons the full tool list).
 - Reduce the warning-as-error backlog so focused fixes can be validated with full local builds more reliably.
 - Keep repo-local workflow docs and ignore files aligned with the real workstation setup.
 

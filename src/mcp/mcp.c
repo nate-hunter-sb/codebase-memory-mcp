@@ -1,4 +1,5 @@
 /* Version: 0.10.1 */
+// Version: 0.10.2
 /*
  * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
  *
@@ -358,10 +359,7 @@ static const tool_def_t TOOLS[] = {
      "\"End line, 1-indexed, >= start_line. Required when using file.\"},"
      "\"project\":{\"type\":\"string\",\"description\":\"Always required.\"},"
      "\"include_neighbors\":{\"type\":\"boolean\",\"default\":false}},"
-     "\"anyOf\":["
-     "{\"required\":[\"qualified_name\",\"project\"]},"
-     "{\"required\":[\"file\",\"start_line\",\"end_line\",\"project\"]}"
-     "]}"},
+     "\"required\":[\"project\"]}"},
 
     {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
