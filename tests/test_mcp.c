@@ -1,3 +1,4 @@
+/* Version: 0.10.0 */
 /*
  * test_mcp.c — Tests for the MCP server module.
  *
@@ -2178,6 +2179,133 @@ TEST(snippet_include_neighbors_enabled) {
     PASS();
 }
 
+/* ── TestSnippet_FileLine_NodeHit ─────────────────────────────── */
+
+TEST(snippet_file_line_node_hit) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"start_line\":3,\"end_line\":5,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"file_line\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"start_line\":3"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_FileLine_InnerRange ──────────────────────────── */
+
+TEST(snippet_file_line_inner_range) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Line 4 is inside HandleRequest (lines 3-5) */
+    char *resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"start_line\":4,\"end_line\":4,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"file_line\""));
+    /* Full node span is returned, not just line 4 */
+    ASSERT_NOT_NULL(strstr(resp, "\"start_line\":3"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_FileLine_RawFallback ─────────────────────────── */
+
+TEST(snippet_file_line_raw_fallback) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Line 1 is "package main" — not an indexed node */
+    char *resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"start_line\":1,\"end_line\":1,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"file_line_raw\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"note\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NULL(strstr(resp, "\"name\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_FileLine_InvalidArgs ─────────────────────────── */
+
+TEST(snippet_file_line_invalid_args) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* end_line < start_line */
+    char *resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"start_line\":5,\"end_line\":3,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "start_line and end_line must be"));
+    free(resp);
+
+    /* start_line == 0 */
+    resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"start_line\":0,\"end_line\":5,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "start_line and end_line must be"));
+    free(resp);
+
+    /* file without start/end — both default to 0 */
+    resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "file requires start_line"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_FileLine_QNPrecedence ────────────────────────── */
+
+TEST(snippet_file_line_qn_precedence) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* QN points to ProcessOrder; file+lines point to HandleRequest (3-5).
+     * QN must win. */
+    char *resp = call_snippet(srv,
+        "{\"qualified_name\":\"test-project.cmd.server.main.ProcessOrder\","
+        "\"file\":\"main.go\",\"start_line\":3,\"end_line\":5,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"ProcessOrder\""));
+    /* Exact QN match has no match_method field */
+    ASSERT_NULL(strstr(resp, "\"match_method\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING — EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -2714,4 +2842,9 @@ SUITE(mcp) {
     RUN_TEST(snippet_auto_resolve_enabled);
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
+    RUN_TEST(snippet_file_line_node_hit);
+    RUN_TEST(snippet_file_line_inner_range);
+    RUN_TEST(snippet_file_line_raw_fallback);
+    RUN_TEST(snippet_file_line_invalid_args);
+    RUN_TEST(snippet_file_line_qn_precedence);
 }

@@ -1,3 +1,4 @@
+/* Version: 0.10.0 */
 /*
  * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
  *
@@ -339,13 +340,28 @@ static const tool_def_t TOOLS[] = {
      "\"}},\"required\":[\"function_name\",\"project\"]}"},
 
     {"get_code_snippet",
-     "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
-     "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
-     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous).",
-     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
-     "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
-     "\"type\":\"string\"},\"include_neighbors\":{"
-     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\",\"project\"]}"},
+     "Read source code for a function/class/symbol. project is always required. "
+     "Accepts either (a) qualified_name from search_graph or search_code, or "
+     "(b) file + start_line + end_line for direct lookup without a prior search. "
+     "When both are provided, qualified_name takes precedence. "
+     "When using file+line, graph metadata is included if the range overlaps an indexed node; "
+     "otherwise source is returned without metadata. "
+     "Note: response always returns the full indexed node span, not just the requested line range.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"qualified_name\":{\"type\":\"string\",\"description\":"
+     "\"Full qualified_name from search_graph or search_code (exact or suffix match)\"},"
+     "\"file\":{\"type\":\"string\",\"description\":"
+     "\"File path as returned by search_code. Alternative to qualified_name.\"},"
+     "\"start_line\":{\"type\":\"integer\",\"description\":"
+     "\"Start line, 1-indexed. Required when using file.\"},"
+     "\"end_line\":{\"type\":\"integer\",\"description\":"
+     "\"End line, 1-indexed, >= start_line. Required when using file.\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Always required.\"},"
+     "\"include_neighbors\":{\"type\":\"boolean\",\"default\":false}},"
+     "\"anyOf\":["
+     "{\"required\":[\"qualified_name\",\"project\"]},"
+     "{\"required\":[\"file\",\"start_line\",\"end_line\",\"project\"]}"
+     "]}"},
 
     {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
@@ -2971,14 +2987,124 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 }
 
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
-    char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
-    char *project = cbm_mcp_get_string_arg(args, "project");
-    bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
+    char *qn             = cbm_mcp_get_string_arg(args, "qualified_name");
+    char *project        = cbm_mcp_get_string_arg(args, "project");
+    bool  include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
+    char *file_arg       = cbm_mcp_get_string_arg(args, "file");
+    int   start_line     = cbm_mcp_get_int_arg(args, "start_line", 0);
+    int   end_line       = cbm_mcp_get_int_arg(args, "end_line", 0);
+
+    /* ── File+line path ─────────────────────────────────────────── */
 
     if (!qn) {
-        free(project);
-        return cbm_mcp_text_result("qualified_name is required", true);
+        if (!file_arg) {
+            free(project);
+            return cbm_mcp_text_result(
+                "qualified_name or file + start_line + end_line is required", true);
+        }
+
+        if (start_line == 0 && end_line == 0) {
+            free(file_arg); free(project);
+            return cbm_mcp_text_result("file requires start_line and end_line", true);
+        }
+        if (start_line < 1 || end_line < 1 || end_line < start_line) {
+            free(file_arg); free(project);
+            return cbm_mcp_text_result(
+                "start_line and end_line must be >= 1 and end_line >= start_line", true);
+        }
+
+        cbm_store_t *fstore = resolve_store(srv, &project);
+        if (!fstore) {
+            char *_err = build_project_list_error("project not found or not indexed");
+            char *_res = cbm_mcp_text_result(_err, true);
+            free(_err); free(file_arg); free(project);
+            return _res;
+        }
+        char *fnot_indexed = verify_project_indexed(fstore, project);
+        if (fnot_indexed) {
+            free(file_arg); free(project);
+            return fnot_indexed;
+        }
+        const char *eff_proj = project ? project : srv->current_project;
+
+        cbm_node_t *fnodes = NULL;
+        int fcount = 0;
+        int frc = cbm_store_find_nodes_by_file_overlap(fstore, eff_proj,
+                      file_arg, start_line, end_line, &fnodes, &fcount);
+        if (frc == CBM_STORE_ERR) {
+            char *_err = build_project_list_error("database error during file lookup");
+            char *_res = cbm_mcp_text_result(_err, true);
+            free(_err); free(file_arg); free(project);
+            return _res;
+        }
+
+        if (fcount >= 1) {
+            /* Pick the tightest node whose span fully contains [start_line, end_line].
+             * Falls back to first node if none fully contains the range. */
+            int best = 0;
+            int best_span = -1;
+            for (int i = 0; i < fcount; i++) {
+                if (fnodes[i].start_line <= start_line && fnodes[i].end_line >= end_line) {
+                    int span = fnodes[i].end_line - fnodes[i].start_line;
+                    if (best_span < 0 || span < best_span) {
+                        best_span = span;
+                        best = i;
+                    }
+                }
+            }
+            cbm_node_t chosen = {0};
+            copy_node(&fnodes[best], &chosen);
+            cbm_store_free_nodes(fnodes, fcount);
+            char *result = build_snippet_response(srv, &chosen, "file_line",
+                               include_neighbors, NULL, 0);
+            free_node_contents(&chosen);
+            free(file_arg); free(project);
+            return result;
+        }
+
+        /* count == 0: nodes always malloc'd — free before raw fallback */
+        cbm_store_free_nodes(fnodes, fcount);
+
+        cbm_project_t fproj = {0};
+        if (cbm_store_get_project(fstore, eff_proj, &fproj) != CBM_STORE_OK) {
+            free(file_arg); free(project);
+            return cbm_mcp_text_result("could not resolve project root", true);
+        }
+        char *root_path = heap_strdup(fproj.root_path);
+        free((void *)fproj.name);
+        free((void *)fproj.indexed_at);
+        free((void *)fproj.root_path);
+
+        char *abs_path = NULL;
+        char *source = resolve_snippet_source(root_path, file_arg,
+                           start_line, end_line, &abs_path);
+        free(root_path);
+        if (!source) {
+            free(abs_path); free(file_arg); free(project);
+            return cbm_mcp_text_result("file not found or not readable", true);
+        }
+
+        yyjson_mut_doc *fdoc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *fobj = yyjson_mut_obj(fdoc);
+        yyjson_mut_doc_set_root(fdoc, fobj);
+        yyjson_mut_obj_add_str(fdoc, fobj, "file_path", file_arg);
+        yyjson_mut_obj_add_int(fdoc, fobj, "start_line", start_line);
+        yyjson_mut_obj_add_int(fdoc, fobj, "end_line", end_line);
+        yyjson_mut_obj_add_str(fdoc, fobj, "source", source);
+        yyjson_mut_obj_add_str(fdoc, fobj, "match_method", "file_line_raw");
+        yyjson_mut_obj_add_str(fdoc, fobj, "note",
+            "No indexed symbol at this range; source returned without graph metadata.");
+        char *fjson = yy_doc_to_str(fdoc);
+        yyjson_mut_doc_free(fdoc);
+        char *fresult = cbm_mcp_text_result(fjson, false);
+        free(fjson);
+        free(source); free(abs_path); free(file_arg); free(project);
+        return fresult;
     }
+
+    free(file_arg); /* QN takes precedence — not needed */
+
+    /* ── QN path (original logic unchanged) ─────────────────────── */
 
     cbm_store_t *store = resolve_store(srv, &project);
     if (!store) {
@@ -3000,7 +3126,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Default to current project (same as all other tools) */
     const char *effective_project = project ? project : srv->current_project;
 
-    /* Tier 1: Exact QN match */
+    /* Exact QN match */
     cbm_node_t node = {0};
     int rc = cbm_store_find_node_by_qn(store, effective_project, qn, &node);
     if (rc == CBM_STORE_OK) {
@@ -3011,7 +3137,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-    /* Tier 2: Suffix match — handles partial QNs ("main.HandleRequest")
+    /* Suffix match — handles partial QNs ("main.HandleRequest")
      * and short names ("ProcessOrder") via LIKE '%.X'. */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;
