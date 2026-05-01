@@ -2339,6 +2339,7 @@ TEST(snippet_file_line_rejects_unindexed) {
     ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"file_line_raw\""));
     free(resp);
 
+    unlink(unindexed_path);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();

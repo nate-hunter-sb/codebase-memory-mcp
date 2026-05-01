@@ -50,8 +50,9 @@ If an agent makes code changes that must affect the binary Codex uses, do all of
    - `affddf1` `fix(windows): restore cache identity compatibility`
 
 2. Rebuild the repo binary.
-   - Do not assume the stock Windows make path works unchanged in this shell.
-   - If the standard build is blocked by toolchain issues, document exactly what was required to get a working local build.
+   - On this machine, WinLibs exposes `mingw32-make`, `gcc.exe`, and `g++.exe`; `Makefile.cbm` selects `gcc`/`g++` by default for Windows MinGW runs.
+   - If compiler selection still needs to be explicit, use `mingw32-make -f Makefile.cbm CC=gcc CXX=g++ cbm`.
+   - If the standard build is blocked by other toolchain issues, document exactly what was required to get a working local build.
 
 3. Run a focused smoke test against the rebuilt repo binary before swapping the installed upstream target.
    - For Windows search/cache work, include the smallest realistic checks for:

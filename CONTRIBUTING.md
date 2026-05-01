@@ -15,7 +15,7 @@ git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
 ```
 
-On Windows, the repo-local scripts remain the primary contract, but local shells may expose `mingw32-make` instead of `make`. If that happens, document the exact invocation used for validation in your PR notes instead of silently skipping verification.
+On Windows, the repo-local scripts remain the primary contract, but local shells may expose `mingw32-make` instead of `make`. With the WinLibs MinGW toolchain on this machine, `Makefile.cbm` defaults to `gcc`/`g++` because WinLibs ships `gcc.exe` and `g++.exe`, not `cc.exe`. If you need to be explicit, use `mingw32-make -f Makefile.cbm CC=gcc CXX=g++ test` and document the exact invocation used for validation in your PR notes instead of silently skipping verification.
 
 macOS: `xcode-select --install` provides clang.
 Linux: `sudo apt install build-essential zlib1g-dev` (Debian/Ubuntu) or `sudo dnf install gcc zlib-devel` (Fedora).

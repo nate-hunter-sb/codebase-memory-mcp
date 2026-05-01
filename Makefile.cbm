@@ -10,7 +10,27 @@
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
 # Linux: gcc/g++ — system default with full sanitizer support
+# Windows MinGW/WinLibs: GNU make defaults CC to cc, but WinLibs ships gcc.exe
+# and g++.exe, so use those when no explicit compiler override was provided.
 # CI scripts pass CC/CXX explicitly; don't rely on defaults here
+IS_WINDOWS_HOST := no
+ifeq ($(OS),Windows_NT)
+IS_WINDOWS_HOST := yes
+endif
+ifneq ($(COMSPEC)$(ComSpec)$(SYSTEMROOT)$(SystemRoot),)
+IS_WINDOWS_HOST := yes
+endif
+
+ifeq ($(IS_WINDOWS_HOST),yes)
+ifeq ($(origin CC),default)
+ifeq ($(filter cc cc.exe,$(notdir $(CC))),$(notdir $(CC)))
+CC := gcc
+endif
+endif
+ifeq ($(origin CXX),default)
+CXX := g++
+endif
+endif
 
 # ── Common flags ─────────────────────────────────────────────────
 
@@ -37,8 +57,17 @@ LIBGIT2_LIBS =
 endif
 
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
-# Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
+# On Windows, avoid Unix-shell probes because WinLibs mingw32-make runs them
+# through cmd.exe. POSIX hosts keep the preprocessor probe for cc/clang wrappers.
+CC_BASENAME := $(notdir $(subst \,/,$(firstword $(CC))))
+IS_GCC := no
+ifeq ($(IS_WINDOWS_HOST),yes)
+ifneq ($(filter gcc gcc.exe %-gcc %-gcc.exe,$(CC_BASENAME)),)
+IS_GCC := yes
+endif
+else
 IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
+endif
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
 GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
@@ -75,7 +104,12 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), and
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
+IS_MINGW := no
+ifeq ($(IS_WINDOWS_HOST),yes)
+IS_MINGW := yes
+else
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
+endif
 WIN32_LIBS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
