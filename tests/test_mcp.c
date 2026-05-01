@@ -1,4 +1,4 @@
-/* Version: 0.10.0 */
+/* Version: 0.10.1 */
 /*
  * test_mcp.c — Tests for the MCP server module.
  *
@@ -2306,6 +2306,44 @@ TEST(snippet_file_line_qn_precedence) {
     PASS();
 }
 
+/* ── TestSnippet_FileLine_RejectsUnindexed ─────────────────────────────── */
+
+TEST(snippet_file_line_rejects_unindexed) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Write a file that was NOT present during indexing — so it is not in
+     * the indexed surface even though it lives under the project root. */
+    char unindexed_path[640];
+    snprintf(unindexed_path, sizeof(unindexed_path), "%s/project/secret.env", tmp);
+    FILE *ufp = fopen(unindexed_path, "w");
+    if (ufp) {
+        fprintf(ufp, "API_KEY=supersecret\n");
+        fclose(ufp);
+    }
+
+    /* Raw fallback must be rejected for the unindexed file. */
+    char *resp = call_snippet(srv,
+        "{\"file\":\"secret.env\",\"start_line\":1,\"end_line\":1,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not part of the indexed project surface"));
+    free(resp);
+
+    /* Indexed file (main.go) at a non-node line still returns raw fallback. */
+    resp = call_snippet(srv,
+        "{\"file\":\"main.go\",\"start_line\":1,\"end_line\":1,"
+        "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"file_line_raw\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING — EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -2847,4 +2885,5 @@ SUITE(mcp) {
     RUN_TEST(snippet_file_line_raw_fallback);
     RUN_TEST(snippet_file_line_invalid_args);
     RUN_TEST(snippet_file_line_qn_precedence);
+    RUN_TEST(snippet_file_line_rejects_unindexed);
 }

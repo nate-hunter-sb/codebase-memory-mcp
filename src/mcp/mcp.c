@@ -1,4 +1,4 @@
-/* Version: 0.10.0 */
+/* Version: 0.10.1 */
 /*
  * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
  *
@@ -3064,6 +3064,34 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
         /* count == 0: nodes always malloc'd — free before raw fallback */
         cbm_store_free_nodes(fnodes, fcount);
+
+        /* Guard: only serve raw source for files in the indexed project surface.
+         * Prevents .env, secrets, generated, or gitignored files from being read
+         * via the raw fallback path merely because they reside under the project root. */
+        {
+            char **fidx = NULL;
+            int fidx_count = 0;
+            bool file_is_indexed = false;
+            if (cbm_store_list_files(fstore, eff_proj, &fidx, &fidx_count) == CBM_STORE_OK) {
+                char *norm_file = heap_strdup(file_arg);
+                cbm_normalize_path_sep(norm_file);
+                for (int fi = 0; fi < fidx_count && !file_is_indexed; fi++) {
+                    cbm_normalize_path_sep(fidx[fi]);
+                    if (strcmp(fidx[fi], norm_file) == 0) {
+                        file_is_indexed = true;
+                    }
+                }
+                free(norm_file);
+                for (int fj = 0; fj < fidx_count; fj++) free(fidx[fj]);
+                free(fidx);
+            }
+            if (!file_is_indexed) {
+                free(file_arg); free(project);
+                return cbm_mcp_text_result(
+                    "file is not part of the indexed project surface; "
+                    "use search_code to find indexed files", true);
+            }
+        }
 
         cbm_project_t fproj = {0};
         if (cbm_store_get_project(fstore, eff_proj, &fproj) != CBM_STORE_OK) {
