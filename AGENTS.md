@@ -5,7 +5,7 @@
 - Repo type: pure C `codebase-memory-mcp` source tree
 - Local machine for this session: Windows 11
 - Preferred local shell on this machine: PowerShell
-- Use `rg` for text search when shell search is needed
+- Use PowerShell-native search (`Select-String`, `Get-ChildItem`) unless `rg` has been verified in the current shell
 - Prefer repo-local source changes in C; do not introduce Go code into this repo
 
 ## Code Search
@@ -14,7 +14,7 @@
 - Start by checking `codebase-memory` scope with `index_status`; call `set_session_project` only when the session project is unset or incorrect.
 - Keep `.cgrignore` current when repo-local caches, generated outputs, vendored mirrors, copied release artifacts, or archived worktrees change so indexing stays focused on active source and docs.
 - Keep `.gitignore` aligned with the same local-only archive and generated-state areas so archived worktrees under `Safe to Delete/` do not become staging noise.
-- If shell search is needed, scope it to this repo and prefer PowerShell-native commands or `rg`.
+- If shell search is needed, scope it to this repo and prefer PowerShell-native commands; use `rg` only after verifying it is available.
 
 ## Project Intent
 
@@ -55,13 +55,15 @@
   - `make -f Makefile.cbm test`
   - `make -f Makefile.cbm security` when shell, subprocess, temp-file, or allowlist behavior changes
 - For targeted foundation/security helper changes, run the smallest relevant foundation-focused test coverage available and report any validation limits on this machine.
+- On this Windows machine, `Makefile.cbm` auto-selects WinLibs `gcc`/`g++` and Windows GCC/MinGW flags when no compiler override is provided; explicit `CC`/`CXX` overrides should remain respected.
+- If Windows builds fail on missing `libsanitizer.spec` or `-lz`, treat that as a local WinLibs sanitizer/zlib installation gap and document the exact fallback used instead of weakening cross-platform Makefile behavior.
 - For `search_code` work, include Windows-specific end-to-end checks for:
   - a repo path containing `&`
   - a safe-name repo path
   - `search_code` with no `file_pattern`
   - `search_code` with `file_pattern`
   - `search_code` with `path_filter`
-- When Windows behavior or deployment wiring changes, keep `.codebase-memory/adr.md` and `docs/WINDOWS_BINARY_DEPLOY.md` aligned with the actual live wrapper/upstream workflow on this machine.
+- When Windows behavior or deployment wiring changes, keep MCP ADR memory updated through `manage_adr` and keep `docs/WINDOWS_BINARY_DEPLOY.md` aligned with the actual live wrapper/upstream workflow on this machine.
 
 # Deletion Policy
 
@@ -76,6 +78,7 @@ Inform the user what was moved in either case.
 
 Be autonomous by default: take action when requirements are clear. If ambiguous or high-risk, stop and ask.
 Do not expose secrets or credentials. Do not print sensitive values to logs. Avoid writing sensitive values to disk.
+- `CLAUDE.md` is tracked Claude-facing tactical context; Codex-facing routing stays in `AGENTS.md` and `CONTEXT.md`, and `.claude/` is local tool state that should not be staged.
 
 ## Parallel Workstreams
 

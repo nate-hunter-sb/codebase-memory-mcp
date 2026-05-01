@@ -4,6 +4,7 @@
 
 .git/
 .codebase-memory/
+.claude/
 Safe to Delete/
 build/
 bin/

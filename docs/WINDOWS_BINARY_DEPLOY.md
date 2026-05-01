@@ -50,9 +50,10 @@ If an agent makes code changes that must affect the binary Codex uses, do all of
    - `affddf1` `fix(windows): restore cache identity compatibility`
 
 2. Rebuild the repo binary.
-   - On this machine, WinLibs exposes `mingw32-make`, `gcc.exe`, and `g++.exe`; `Makefile.cbm` selects `gcc`/`g++` by default for Windows MinGW runs.
-   - If compiler selection still needs to be explicit, use `mingw32-make -f Makefile.cbm CC=gcc CXX=g++ cbm`.
-   - If the standard build is blocked by other toolchain issues, document exactly what was required to get a working local build.
+   - On this machine, WinLibs exposes `mingw32-make`, `gcc.exe`, and `g++.exe`; `Makefile.cbm` selects `gcc`/`g++` by default for Windows MinGW runs when no explicit compiler override is provided.
+   - Normal rebuild command: `mingw32-make -f Makefile.cbm cbm`.
+   - Intentional compiler checks can still pass explicit `CC`/`CXX`; those overrides should remain respected.
+   - If the standard build is blocked by local `libsanitizer.spec` or `-lz` availability, document exactly which focused fallback was required, such as `SANITIZE=` for test builds or a non-static `WIN32_LIBS` on a WinLibs install without static zlib.
 
 3. Run a focused smoke test against the rebuilt repo binary before swapping the installed upstream target.
    - For Windows search/cache work, include the smallest realistic checks for:

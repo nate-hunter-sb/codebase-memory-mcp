@@ -15,7 +15,13 @@ git config core.hooksPath scripts/hooks  # activates pre-commit security checks
 scripts/build.sh
 ```
 
-On Windows, the repo-local scripts remain the primary contract, but local shells may expose `mingw32-make` instead of `make`. With the WinLibs MinGW toolchain on this machine, `Makefile.cbm` defaults to `gcc`/`g++` because WinLibs ships `gcc.exe` and `g++.exe`, not `cc.exe`. If you need to be explicit, use `mingw32-make -f Makefile.cbm CC=gcc CXX=g++ test` and document the exact invocation used for validation in your PR notes instead of silently skipping verification.
+On Windows, local shells may expose `mingw32-make` instead of `make`. With the WinLibs MinGW toolchain on this machine, `Makefile.cbm` detects Windows hosts, defaults GNU make's built-in `CC=cc` to `gcc`, defaults `CXX` to `g++`, and sets Windows GCC/MinGW flags without requiring `IS_GCC=yes` or `IS_MINGW=yes`.
+
+```powershell
+mingw32-make -f Makefile.cbm test
+```
+
+If this workstation's WinLibs install is missing sanitizer support or static zlib, document that as a local toolchain/library limitation and use the smallest focused fallback needed for validation, for example `SANITIZE=` or a non-static `WIN32_LIBS`. Explicit `CC`/`CXX` overrides are still respected when intentionally testing another compiler.
 
 macOS: `xcode-select --install` provides clang.
 Linux: `sudo apt install build-essential zlib1g-dev` (Debian/Ubuntu) or `sudo dnf install gcc zlib-devel` (Fedora).

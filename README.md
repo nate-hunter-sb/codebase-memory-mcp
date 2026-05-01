@@ -325,7 +325,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns. Run this first. |
-| `get_code_snippet` | Read source code for a function by qualified name. |
+| `get_code_snippet` | Read source code by qualified name or indexed file+line range. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. See `docs/WINDOWS_SEARCH.md` for platform-specific notes. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
@@ -351,7 +351,7 @@ Platform-specific maintainer notes for `search_code`, especially on Windows, liv
 
 ### Qualified Names
 
-`get_code_snippet` uses qualified names: `<project>.<path_parts>.<name>`. Use `search_graph` to discover them first.
+`get_code_snippet` supports qualified names (`<project>.<path_parts>.<name>`) and file+line requests for files already in the indexed project surface. Use `search_graph` or `search_code` to discover valid targets first.
 
 ### Supported Cypher Subset
 

@@ -27,11 +27,12 @@ At a high level, the runtime separates into four layers:
 
 ### MCP and Interfaces
 
-`src/mcp/` owns the JSON-RPC server, request validation, tool dispatch, cache/store selection, and higher-level workflows such as project lookup and graph search. `src/cli/` wraps installation, update, and configuration flows. `src/ui/` serves the optional graph UI, while `src/watcher/` handles background auto-sync and git-based change detection.
+`src/mcp/` owns the JSON-RPC server, request validation, tool dispatch, cache/store selection, and higher-level workflows such as project lookup, graph search, and source snippet retrieval. `get_code_snippet` supports qualified-name lookup and indexed file+line lookup; its raw file-line fallback is restricted to files returned by the project index, not merely any file under the repository root. `src/cli/` wraps installation, update, and configuration flows. `src/ui/` serves the optional graph UI, while `src/watcher/` handles background auto-sync and git-based change detection.
 
 ## Important Boundaries
 
 - Keep temp-path and shell-facing behavior platform-safe. Prefer the temp helpers in `src/foundation/compat.*` and validate inputs before they reach backend execution.
+- Keep file-backed MCP reads scoped to the indexed project surface unless a deliberate, reviewed API change approves broader filesystem access.
 - Keep MCP tool names, defaults, and payload contracts stable unless a deliberate API change is approved.
 - Keep Windows deployment concerns separate from repo build concerns. Repo build output does not automatically replace the installed upstream binary used by local wrappers.
 - Keep ignore-file policy aligned with the local workflow: `.cgrignore` for indexing focus and `.gitignore` for staging hygiene.

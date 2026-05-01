@@ -1,6 +1,8 @@
 # codebase-memory-mcp
 
-Open-source C MCP server — 14 graph tools over a SQLite knowledge graph, tree-sitter AST
+Claude-facing tactical context. Codex-facing routing stays in `AGENTS.md` and `CONTEXT.md`.
+
+Open-source C MCP server — 15 MCP tools over a SQLite knowledge graph, tree-sitter AST
 extraction, and semantic embeddings. Core files: `src/mcp/mcp.c` (~5100 lines),
 `src/store/store.c` (~5000 lines), `tests/test_mcp.c` (~2890 lines).
 
@@ -11,21 +13,21 @@ Always use `cstol_read` for these files; never plain `Read`.
 ## Build — Windows / MinGW WinLibs
 
 ```
-mingw32-make -f Makefile.cbm test SANITIZE= IS_GCC=yes IS_MINGW=yes "WIN32_LIBS=-lws2_32 -lpsapi -Wl,--allow-multiple-definition -Wl,--stack,8388608"
+mingw32-make -f Makefile.cbm test
 ```
 
-| Override | Why |
-|----------|-----|
-| `SANITIZE=` | ASan/UBSan unavailable on MinGW — omit or linker fails |
-| `IS_GCC=yes` | Shell detection uses `!` operator (bash-ism); fails in sh.exe |
-| `IS_MINGW=yes` | Same issue; needed to include `tre.o` and Winsock libs |
-| `WIN32_LIBS=...` (no `-static`) | `-static` forces static zlib which isn't installed |
+`Makefile.cbm` detects Windows via `OS`, `COMSPEC`/`ComSpec`, or
+`SYSTEMROOT`/`SystemRoot`. It auto-selects WinLibs `gcc`/`g++`, GCC-only flags,
+MinGW support, and Windows libs when no explicit compiler override is provided.
+Intentional `CC`/`CXX` overrides should stay respected.
 
-`CC`/`CXX` are auto-set to `gcc`/`g++` on Windows via `IS_WINDOWS_HOST` detection in
-`Makefile.cbm` — no need to pass them explicitly.
+| Focused fallback | Use only when |
+|------------------|---------------|
+| `SANITIZE=` | Local WinLibs is missing `libsanitizer.spec` |
+| `WIN32_LIBS=...` without `-static` | Local WinLibs/zlib lacks static zlib and link fails on `-lz` |
 
-**Running tests:** The `test` make target uses `cd X && binary` which fails in MinGW
-cmd.exe. Build with the command above; then run the binary directly:
+**Running tests:** If the `test` make target builds successfully but the local shell
+blocks the recipe's run step, run the binary directly:
 
 ```powershell
 .\build\c\test-runner.exe
