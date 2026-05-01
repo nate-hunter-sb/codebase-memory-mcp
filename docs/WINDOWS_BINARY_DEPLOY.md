@@ -54,6 +54,7 @@ If an agent makes code changes that must affect the binary Codex uses, do all of
    - Normal rebuild command: `mingw32-make -f Makefile.cbm cbm`.
    - Intentional compiler checks can still pass explicit `CC`/`CXX`; those overrides should remain respected.
    - If the standard build is blocked by local `libsanitizer.spec` or `-lz` availability, document exactly which focused fallback was required, such as `SANITIZE=` for test builds or a non-static `WIN32_LIBS` on a WinLibs install without static zlib.
+   - `Makefile.cbm` checks these Windows WinLibs gaps up front. A missing `libsanitizer.spec` diagnostic means the selected compiler cannot support the requested sanitizer flags; use `SANITIZE=` only as an explicit focused fallback. A missing `libz.a` diagnostic means static MinGW linking cannot find static zlib; install static zlib or intentionally override `WIN32_LIBS` for a non-static local validation.
 
 3. Run a focused smoke test against the rebuilt repo binary before swapping the installed upstream target.
    - For Windows search/cache work, include the smallest realistic checks for:

@@ -124,6 +124,30 @@ LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAG
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
 
+# Windows WinLibs preflight diagnostics. These do not disable sanitizers or
+# static linking; they fail early with the local toolchain/library gap and the
+# focused override to use when validating that gap intentionally.
+CBM_WINDOWS_SANITIZER_SPEC :=
+CBM_WINDOWS_SANITIZER_MISSING := no
+CBM_WINDOWS_STATIC_ZLIB :=
+CBM_WINDOWS_STATIC_ZLIB_MISSING := no
+
+ifeq ($(IS_MINGW),yes)
+ifneq ($(findstring -fsanitize,$(SANITIZE)),)
+CBM_WINDOWS_SANITIZER_SPEC := $(shell $(CC) -print-file-name=libsanitizer.spec 2>NUL)
+ifeq ($(wildcard $(CBM_WINDOWS_SANITIZER_SPEC)),)
+CBM_WINDOWS_SANITIZER_MISSING := yes
+endif
+endif
+
+ifneq ($(findstring -static,$(WIN32_LIBS) $(STATIC_FLAGS)),)
+CBM_WINDOWS_STATIC_ZLIB := $(shell $(CC) -print-file-name=libz.a 2>NUL)
+ifeq ($(wildcard $(CBM_WINDOWS_STATIC_ZLIB)),)
+CBM_WINDOWS_STATIC_ZLIB_MISSING := yes
+endif
+endif
+endif
+
 # ── Source files ─────────────────────────────────────────────────
 
 FOUNDATION_SRCS = \
@@ -377,7 +401,15 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: check-windows-build-env check-windows-sanitizer check-windows-static-zlib test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+
+check-windows-build-env: check-windows-sanitizer check-windows-static-zlib
+
+check-windows-sanitizer:
+	$(if $(filter yes,$(CBM_WINDOWS_SANITIZER_MISSING)),$(error Windows MinGW sanitizer flags are enabled, but $(CC) cannot locate libsanitizer.spec (reported: '$(CBM_WINDOWS_SANITIZER_SPEC)'). Install a WinLibs toolchain with sanitizer support or rerun this focused validation with SANITIZE= to disable sanitizer flags intentionally),)
+
+check-windows-static-zlib:
+	$(if $(filter yes,$(CBM_WINDOWS_STATIC_ZLIB_MISSING)),$(error Windows MinGW static linking is enabled, but $(CC) cannot locate static zlib libz.a (reported: '$(CBM_WINDOWS_STATIC_ZLIB)'). Install the static zlib package/library for this WinLibs toolchain or rerun this focused validation with a non-static WIN32_LIBS override),)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -387,7 +419,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
 
-test-foundation: $(BUILD_DIR)/test-foundation
+test-foundation: check-windows-sanitizer check-windows-static-zlib $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
@@ -471,7 +503,7 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
-test: $(BUILD_DIR)/test-runner
+test: check-windows-sanitizer check-windows-static-zlib $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
 
 # ── TSan full test ───────────────────────────────────────────────
@@ -517,7 +549,7 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp
+cbm: check-windows-static-zlib $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
@@ -535,7 +567,7 @@ frontend:
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD)
+cbm-with-ui: check-windows-static-zlib embed $(OBJS_VENDORED_PROD)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(SQLITE_WRITER_SRC) \

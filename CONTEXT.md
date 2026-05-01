@@ -45,7 +45,7 @@ Use this file when you need to understand what the repo is, what matters right n
 - Shell-backed flows must avoid hardcoded POSIX temp paths and prefer the compatibility helpers in `src/foundation/compat.*`.
 - When callers need owned temp-path storage, prefer `cbm_get_tmpdir()`, `cbm_temp_path()`, and `cbm_temp_template()` instead of relying on shared pointer-returning helpers.
 - `Makefile.cbm` detects Windows hosts through `OS`, `COMSPEC`/`ComSpec`, and `SYSTEMROOT`/`SystemRoot`; it substitutes WinLibs `gcc`/`g++` only for default compiler values, so intentional `CC`/`CXX` overrides remain respected.
-- Missing `libsanitizer.spec` or `-lz` failures on this workstation are local WinLibs sanitizer/zlib gaps, not regressions in the Windows compiler-selection logic.
+- `Makefile.cbm` preflights missing WinLibs `libsanitizer.spec` and static `libz.a` support so those local toolchain gaps fail with actionable diagnostics before a noisy compile/link step.
 - On this workstation, repo build output and the live Codex-installed binary are separate concerns. See `docs/WINDOWS_BINARY_DEPLOY.md` before assuming a rebuilt repo binary is already live.
 
 ## Current Handoff Notes

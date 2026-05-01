@@ -23,6 +23,15 @@ mingw32-make -f Makefile.cbm test
 
 If this workstation's WinLibs install is missing sanitizer support or static zlib, document that as a local toolchain/library limitation and use the smallest focused fallback needed for validation, for example `SANITIZE=` or a non-static `WIN32_LIBS`. Explicit `CC`/`CXX` overrides are still respected when intentionally testing another compiler.
 
+`Makefile.cbm` now preflights those common Windows gaps before compiling. If
+sanitizer flags are enabled but the selected compiler cannot find
+`libsanitizer.spec`, install a WinLibs package with sanitizer support or rerun
+the focused local validation with `SANITIZE=`. If static MinGW linking is
+enabled but `libz.a` is unavailable, install static zlib for the selected
+WinLibs toolchain or use a deliberate non-static `WIN32_LIBS` override for that
+validation run. Do not silently disable sanitizers or static linking in the
+Makefile to work around a local toolchain install.
+
 macOS: `xcode-select --install` provides clang.
 Linux: `sudo apt install build-essential zlib1g-dev` (Debian/Ubuntu) or `sudo dnf install gcc zlib-devel` (Fedora).
 
