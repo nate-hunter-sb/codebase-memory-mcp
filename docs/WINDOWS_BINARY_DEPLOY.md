@@ -34,11 +34,11 @@ That launcher sets `CODEBASE_MEMORY_MCP_UPSTREAM` and then starts the wrapper. T
 
 ## Current Upstream Target
 
-As of 2026-04-08, the wrapper launcher was updated to point at:
+As of 2026-05-02, the wrapper launcher was updated to point at:
 
-- `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-windows-cache-identity-20260408.exe`
+- `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-fix-anyof-schema-20260502.exe`
 
-That file was copied from the repo build output and matched it byte-for-byte by SHA-256 at the time of deployment.
+That file was copied from the repo build output and matched it byte-for-byte by SHA-256 at the time of deployment. It includes the `get_code_snippet` file+line support while keeping tool schemas compatible with Claude's validator by avoiding top-level `anyOf`/`allOf`/`oneOf`.
 
 ## What To Do After Making Repo Fixes
 
@@ -75,16 +75,16 @@ If an agent makes code changes that must affect the binary Codex uses, do all of
    - `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\launch-codebase-memory-mcp-wrapper.cmd`
    - Change only the `CODEBASE_MEMORY_MCP_UPSTREAM=...` target unless wrapper behavior itself must change.
 
-6. Restart Codex after the launcher change.
+6. Restart or recycle every active client using the launcher after the launcher change.
    - A repo build alone is not enough.
    - A launcher-file edit alone is not enough.
-   - The running Codex wrapper process must be restarted to pick up the new upstream target.
+   - Running Claude and Codex wrapper/upstream processes must exit before they pick up the new upstream target.
 
 7. Verify the live process tree after restart.
    - Confirm whether Codex is running:
    - `codebase-memory-mcp-codex-wrapper-trace-path.exe`
    - Confirm which upstream binary the wrapper now points to.
-   - Do not confuse Claude-owned processes with Codex-owned processes.
+   - Do not confuse Claude-owned processes with Codex-owned processes; both may use this launcher on this machine.
 
 ## What Not To Change Carelessly
 
@@ -126,9 +126,9 @@ Get-CimInstance Win32_Process | Where-Object {
 
 ```powershell
 Get-FileHash 'C:\Users\nate.hunter\Documents\Playground\codebase-memory-mcp\build\c\codebase-memory-mcp.exe' -Algorithm SHA256
-Get-FileHash 'C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-windows-cache-identity-20260408.exe' -Algorithm SHA256
+Get-FileHash 'C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-fix-anyof-schema-20260502.exe' -Algorithm SHA256
 ```
 
 ## Summary For Future Agents
 
-If the repo code is fixed but Codex still behaves like the old binary, the most likely cause is that the wrapper launcher is still pointing at an older installed upstream executable. Check `launch-codebase-memory-mcp-wrapper.cmd`, not just the repo build output.
+If the repo code is fixed but Claude or Codex still behaves like the old binary, the most likely cause is that the wrapper launcher is still pointing at an older installed upstream executable or an old wrapper/upstream process is still alive. Check `launch-codebase-memory-mcp-wrapper.cmd` and the live process tree, not just the repo build output.

@@ -10,11 +10,13 @@ Current Windows state:
 - `search_code` has a Windows-safe backend path that works on repos with `&` in the path, safe-name repos, `file_pattern`, and `path_filter`.
 - Windows project identity and cache compatibility canonicalize drive letters consistently and recover legacy lowercase-drive caches so `index_status`, `get_architecture`, `manage_adr`, and related flows remain usable.
 - `Makefile.cbm` detects Windows hosts through `OS`, `COMSPEC`/`ComSpec`, and `SYSTEMROOT`/`SystemRoot`; for default GNU make compiler values it selects WinLibs `gcc`/`g++`, sets Windows GCC/MinGW detection without Unix shell probes, and preserves explicit `CC`/`CXX` overrides.
+- As of 2026-05-02, the local wrapper launcher points at `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-fix-anyof-schema-20260502.exe`, copied from the rebuilt repo binary with matching SHA-256 `7188990F48C57296AC354EBE8F5655BB91F77BC12DBBE08E6ED9B24CB110A456`. The build used the known Windows fallback command with `SANITIZE=` and explicit non-static `WIN32_LIBS`.
 
 ## TRADEOFFS
 - The single-binary approach keeps install friction low, but cross-platform shell/build helper paths remain sensitive to POSIX assumptions.
 - Vendored dependencies keep the runtime self-contained, but they should usually stay out of repo-focused indexing and agent exploration.
-- The custom Codex wrapper deployment on this workstation is separate from the repo build output: after rebuilding and validating the repo binary, the installed upstream target must be updated and Codex restarted before changes are live.
+- The custom wrapper deployment on this workstation is separate from the repo build output: after rebuilding and validating the repo binary, the installed upstream target must be updated and every active Claude/Codex wrapper session using the launcher must be recycled before changes are live.
 - Local WinLibs failures such as missing `libsanitizer.spec` or `-lz` are toolchain/library gaps, not application regressions. Document focused fallbacks such as `SANITIZE=` or non-static `WIN32_LIBS` rather than broadening the Makefile silently.
 - Claude-facing tactical context may live in tracked `CLAUDE.md`, but Codex-facing routing should stay in `AGENTS.md` and `CONTEXT.md`; `.claude/` is local tool state and should not be staged.
 - MCP tool inputSchema design must stay compatible with all supported agent validators. Top-level composition keywords (`anyOf`, `allOf`, `oneOf`) cause HTTP 400 at tool-load time and break the entire tool list — not just the offending tool. Prefer flat `required` arrays and runtime handler validation.
+- After wrapper launcher retargets, recycle or restart every active client that uses the launcher, including Claude and Codex sessions, because stale MCP wrapper/upstream processes can keep serving older binaries until they exit.
