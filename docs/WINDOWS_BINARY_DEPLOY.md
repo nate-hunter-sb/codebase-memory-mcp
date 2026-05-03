@@ -34,11 +34,16 @@ That launcher sets `CODEBASE_MEMORY_MCP_UPSTREAM` and then starts the wrapper. T
 
 ## Current Upstream Target
 
-As of 2026-05-02, the wrapper launcher was updated to point at:
+As of 2026-05-03, the wrapper launcher was updated to point at:
 
-- `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-fix-anyof-schema-20260502.exe`
+- `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-show-token-savings-20260502.exe`
 
-That file was copied from the repo build output and matched it byte-for-byte by SHA-256 at the time of deployment. It includes the `get_code_snippet` file+line support while keeping tool schemas compatible with Claude's validator by avoiding top-level `anyOf`/`allOf`/`oneOf`.
+SHA-256: `E62D5C1DBE5C0BD7AC64985246C68E7EA1B9F14CEBDA6FE25BE3C52FE9A80927`
+
+That file was copied from the repo build output (v0.10.3). It includes per-tool baseline savings
+reporting in `show_token_savings` (exact for `get_code_snippet`/`manage_adr`; unique-file dedup × 8 KB
+for search/trace; mode-aware raw cap for `search_code`; test-file filter for `trace_path`), as well as
+the `get_code_snippet` file+line support and tool schema fixes from v0.10.0–v0.10.2.
 
 ## What To Do After Making Repo Fixes
 

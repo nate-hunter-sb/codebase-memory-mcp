@@ -1,16 +1,18 @@
 codebase-memory-mcp is a pure C MCP server for structural code intelligence. It indexes repositories into a persistent SQLite graph and exposes MCP tools for search, architecture, tracing, impact analysis, ADR management, graph queries, source snippets, and session-level token savings reporting.
 
+Current version: 0.10.3
+
 Current notable MCP/tool behavior:
 - The tool surface is 15 MCP tools, including `show_token_savings` and `get_code_snippet`.
-- `show_token_savings` reports process-lifetime per-tool call counts and estimated input/output token volumes. Stats are process-wide file-scope atomics in `src/mcp/mcp.c`, so stdio and HTTP server instances share the counters when both are active.
+- `show_token_savings` (v0.10.3) reports genuine per-tool savings against a naive file-read baseline. Formula: saved = baseline − (input + output), clamped ≥ 0 per tool; total_saved_tokens is the sum of per-tool clamped values. Baselines: exact cbm_file_size for get_code_snippet and manage_adr; unique-file dedup × 8 KB for search_graph, search_code (raw cap is mode-aware: full raw_count for files mode, min(raw_count,20) otherwise), get_architecture, and trace_path (test files excluded when include_tests=false); fixed 4 KB offset for detect_changes; zero for index_status/list_projects/get_graph_schema/ingest_traces. Stats are process-wide file-scope atomics; stdio and HTTP server instances share the counters when both active.
 - `get_code_snippet` supports both qualified-name lookup and file/start/end lookup. For file+line requests, indexed node overlaps return `match_method: file_line`; raw gap fallback returns `match_method: file_line_raw` only when the requested file is part of the indexed project surface from `cbm_store_list_files`. Root-contained but unindexed files must be rejected.
 - MCP tool inputSchemas must not use top-level `anyOf`/`allOf`/`oneOf` — Claude's tool validator rejects these with HTTP 400 and poisons the full tool list. As of v0.10.2 the `get_code_snippet` schema was flattened to `required: ["project"]`; mutual-exclusion between `qualified_name` and `file+start_line+end_line` is enforced in the handler. A regression test `mcp_tools_no_top_level_anyof` in `tests/test_mcp.c` guards this constraint.
 
 Current Windows state:
-- `search_code` has a Windows-safe backend path that works on repos with `&` in the path, safe-name repos, `file_pattern`, and `path_filter`.
+- `search_code` has a Windows-safe backend path that works on repos with `&` in the path, safe-name repos, `file_pattern`, and `path_filter`. search_code baseline is mode-aware: files mode uses full raw_count, compact/full modes cap at 20.
 - Windows project identity and cache compatibility canonicalize drive letters consistently and recover legacy lowercase-drive caches so `index_status`, `get_architecture`, `manage_adr`, and related flows remain usable.
 - `Makefile.cbm` detects Windows hosts through `OS`, `COMSPEC`/`ComSpec`, and `SYSTEMROOT`/`SystemRoot`; for default GNU make compiler values it selects WinLibs `gcc`/`g++`, sets Windows GCC/MinGW detection without Unix shell probes, and preserves explicit `CC`/`CXX` overrides.
-- As of 2026-05-02, the local wrapper launcher points at `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-fix-anyof-schema-20260502.exe`, copied from the rebuilt repo binary with matching SHA-256 `7188990F48C57296AC354EBE8F5655BB91F77BC12DBBE08E6ED9B24CB110A456`. The build used the known Windows fallback command with `SANITIZE=` and explicit non-static `WIN32_LIBS`.
+- As of 2026-05-03, the local wrapper launcher points at `C:\Users\nate.hunter\AppData\Local\codebase-memory-mcp\codebase-memory-mcp-upstream-show-token-savings-20260502.exe`, SHA-256 `E62D5C1DBE5C0BD7AC64985246C68E7EA1B9F14CEBDA6FE25BE3C52FE9A80927`, copied from the rebuilt repo binary (v0.10.3). The build used the known Windows fallback command with `SANITIZE=` and explicit non-static `WIN32_LIBS`.
 
 ## TRADEOFFS
 - The single-binary approach keeps install friction low, but cross-platform shell/build helper paths remain sensitive to POSIX assumptions.
@@ -19,4 +21,5 @@ Current Windows state:
 - Local WinLibs failures such as missing `libsanitizer.spec` or `-lz` are toolchain/library gaps, not application regressions. Document focused fallbacks such as `SANITIZE=` or non-static `WIN32_LIBS` rather than broadening the Makefile silently.
 - Claude-facing tactical context may live in tracked `CLAUDE.md`, but Codex-facing routing should stay in `AGENTS.md` and `CONTEXT.md`; `.claude/` is local tool state and should not be staged.
 - MCP tool inputSchema design must stay compatible with all supported agent validators. Top-level composition keywords (`anyOf`, `allOf`, `oneOf`) cause HTTP 400 at tool-load time and break the entire tool list — not just the offending tool. Prefer flat `required` arrays and runtime handler validation.
-- After wrapper launcher retargets, recycle or restart every active client that uses the launcher, including Claude and Codex sessions, because stale MCP wrapper/upstream processes can keep serving older binaries until they exit.
+- After wrapper launcher retargets, recycle or restart every active client using the launcher, including Claude and Codex sessions, because stale MCP wrapper/upstream processes can keep serving older binaries until they exit.
+- show_token_savings baseline accuracy requires that each handler mirrors its own output-assembly logic: caps, mode branches, and filter predicates (e.g. is_test_file) must stay synchronized between the output path and the record_tool_baseline call.

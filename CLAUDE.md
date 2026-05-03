@@ -3,8 +3,8 @@
 Claude-facing tactical context. Codex-facing routing stays in `AGENTS.md` and `CONTEXT.md`.
 
 Open-source C MCP server — 15 MCP tools over a SQLite knowledge graph, tree-sitter AST
-extraction, and semantic embeddings. Core files: `src/mcp/mcp.c` (~5160 lines),
-`src/store/store.c` (~5000 lines), `tests/test_mcp.c` (~2903 lines).
+extraction, and semantic embeddings. Core files: `src/mcp/mcp.c` (~5331 lines),
+`src/store/store.c` (~5000 lines), `tests/test_mcp.c` (~2950 lines).
 
 Always use `cstol_read` for these files; never plain `Read`.
 
@@ -51,11 +51,12 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
 
 | Symbol | Location | Notes |
 |--------|----------|-------|
-| `handle_get_code_snippet` | `src/mcp/mcp.c:2987` | QN path + file+line path |
-| `resolve_snippet_source` | `src/mcp/mcp.c:2842` | Root containment check then `read_file_lines` |
-| `build_snippet_response` | `src/mcp/mcp.c:~2887` | Builds JSON for indexed nodes |
-| `load_scoped_indexed_files` | `src/mcp/mcp.c:~3262` | Wraps `cbm_store_list_files`; static — defined late |
-| `free_indexed_file_list` | `src/mcp/mcp.c:~3252` | Static, defined late — **do not call before its definition** |
+| `record_tool_baseline` | `src/mcp/mcp.c:498` | Called from inside handlers on success paths; records naive-alternative file-read cost for `show_token_savings` |
+| `handle_get_code_snippet` | `src/mcp/mcp.c:3099` | QN path + file+line path |
+| `resolve_snippet_source` | `src/mcp/mcp.c:2947` | Root containment check then `read_file_lines` |
+| `build_snippet_response` | `src/mcp/mcp.c:~2995` | Builds JSON for indexed nodes |
+| `load_scoped_indexed_files` | `src/mcp/mcp.c:~3405` | Wraps `cbm_store_list_files`; static — defined late |
+| `free_indexed_file_list` | `src/mcp/mcp.c:~3395` | Static, defined late — **do not call before its definition** |
 | `cbm_store_list_files` | `src/store/store.c:1742` | `SELECT DISTINCT file_path FROM nodes WHERE project=?` — canonical indexed surface |
 | `cbm_store_find_nodes_by_file_overlap` | `src/store/store.c:1616` | **Always** `malloc`s result on `CBM_STORE_OK` (free even when count==0); does NOT allocate on `CBM_STORE_ERR` |
 | `setup_snippet_server` | `tests/test_mcp.c:~848` | Test fixture: `main.go` with HandleRequest(3–5), ProcessOrder(7–9), Run(11–13) |
@@ -79,6 +80,16 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
 - **No top-level `anyOf`/`allOf`/`oneOf` in tool schemas** — Claude's tool validator rejects
   these with HTTP 400, poisoning the full tool list. Express mutual-exclusion constraints in
   the handler; keep `required` flat (e.g. `["project"]` only).
+
+---
+
+## show_token_savings baseline model — v0.10.3
+
+`baseline_bytes` field in `cbm_tool_stats_t`; `record_tool_baseline()` called from each handler.
+Savings formula: `saved = baseline − (input + output)`, clamped ≥ 0 per tool; `total_saved_tokens`
+is the sum of per-tool clamped values. Baselines: exact file size for `get_code_snippet`/`manage_adr`;
+unique-file dedup × 8 KB for search tools (raw cap is mode-aware for `search_code`); unique-file dedup
+× 8 KB for `trace_path` (test files excluded when `include_tests=false`); fixed 4 KB for `detect_changes`.
 
 ---
 

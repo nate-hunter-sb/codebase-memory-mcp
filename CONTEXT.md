@@ -16,6 +16,7 @@ Use this file when you need to understand what the repo is, what matters right n
 - Optional HTTP graph UI served from the same binary
 - SQLite-backed project graph cache and metadata
 - `get_code_snippet` supports both qualified-name lookup and indexed file+line ranges; raw file-line fallback is limited to files already in the indexed project surface
+- `show_token_savings` reports genuine per-tool savings against a naive file-read baseline (v0.10.3): exact for `get_code_snippet`/`manage_adr`, unique-file dedup × 8 KB estimate for search/trace/architecture tools
 - Vendored parser/runtime dependencies, including tree-sitter grammars and supporting libraries
 - Cross-platform compatibility layers under `src/foundation/`
 
