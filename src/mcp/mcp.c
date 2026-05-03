@@ -2640,6 +2640,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         for (int tri_ = 0; tri_ < tr_out.visited_count && tr_nseen_ < 256; tri_++) {
             const char *fp_ = tr_out.visited[tri_].node.file_path;
             if (!fp_ || !fp_[0]) continue;
+            if (!include_tests && is_test_file(fp_)) continue;
             bool dup_ = false;
             for (int trk_ = 0; trk_ < tr_nseen_; trk_++) {
                 if (strcmp(tr_seen_[trk_], fp_) == 0) { dup_ = true; break; }
@@ -2649,6 +2650,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         for (int tri_ = 0; tri_ < tr_in.visited_count && tr_nseen_ < 256; tri_++) {
             const char *fp_ = tr_in.visited[tri_].node.file_path;
             if (!fp_ || !fp_[0]) continue;
+            if (!include_tests && is_test_file(fp_)) continue;
             bool dup_ = false;
             for (int trk_ = 0; trk_ < tr_nseen_; trk_++) {
                 if (strcmp(tr_seen_[trk_], fp_) == 0) { dup_ = true; break; }
@@ -4351,11 +4353,15 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                           context_lines, root_path);
 
     /* Baseline: count unique files in the actually emitted result set.
-     * Mirrors assemble_search_output: min(sr_count,limit) graph results
-     * plus min(raw_count,20) raw matches — same caps used during output. */
+     * Mirrors assemble_search_output caps:
+     *   graph: min(sr_count, limit)
+     *   raw:   min(raw_count, 20) for compact/full; full raw_count for files mode
+     *          (build_dedup_files_array iterates all raw entries when mode==files). */
     {
-        int sc_out_ = sr_count  < limit ? sr_count  : limit;
-        int sc_raw_ = raw_count < 20    ? raw_count : 20;
+        int sc_out_ = sr_count < limit ? sr_count : limit;
+        /* mode 2 = files: build_dedup_files_array uses full raw_count, no 20 cap */
+        int sc_raw_ = (mode == 2) ? raw_count
+                                  : (raw_count < 20 ? raw_count : 20);
         const char *sc_seen_[256];
         int sc_nseen_ = 0;
         for (int sci_ = 0; sci_ < sc_out_ && sc_nseen_ < 256; sci_++) {
