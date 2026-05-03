@@ -94,7 +94,7 @@ These 3 fail on Windows only — unrelated to snippet/MCP code; do not investiga
 
 ## Version
 
-Current: `0.10.2`
+Current: `0.10.3`
 
 ## ADR
 

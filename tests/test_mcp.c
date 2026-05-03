@@ -1,5 +1,5 @@
-/* Version: 0.10.1 */
-// Version: 0.10.2
+/* Version: 0.10.3 */
+// Version: 0.10.3
 /*
  * test_mcp.c — Tests for the MCP server module.
  *
@@ -2725,8 +2725,8 @@ TEST(show_token_savings_empty) {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
         "\"params\":{\"name\":\"show_token_savings\",\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"total_calls\":0"));
-    ASSERT_NOT_NULL(strstr(resp, "\"by_tool\":[]"));
+    ASSERT_NOT_NULL(strstr(resp, "total_calls\\\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "by_tool\\\":[]"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -2751,11 +2751,54 @@ TEST(show_token_savings_after_calls) {
         "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
         "\"params\":{\"name\":\"show_token_savings\",\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"list_projects\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"total_calls\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "list_projects"));
+    ASSERT_NOT_NULL(strstr(resp, "total_calls\\\":2"));
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_savings_baseline_after_snippet) {
+    /* After a get_code_snippet call, show_token_savings must report
+     * baseline_tokens > 0 for the snippet tool. Uses cbm_mcp_server_handle
+     * (not cbm_mcp_handle_tool) so the central record_tool_stats path runs.
+     * Tests baseline_tokens (not saved_tokens) because the fixture file is tiny
+     * and net savings may be 0 if output metadata exceeds file size. */
+    cbm_tool_stats_reset();
+
+    char tmp_dir[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp_dir, sizeof(tmp_dir));
+    ASSERT_NOT_NULL(srv);
+
+    char *r1 = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"get_code_snippet\","
+        "\"arguments\":{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\"}}}");
+    ASSERT_NOT_NULL(r1);
+    free(r1);
+
+    char *r2 = cbm_mcp_server_handle(srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"show_token_savings\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_NOT_NULL(strstr(r2, "baseline_tokens"));
+
+    /* baseline_tokens for get_code_snippet must be positive.
+     * In the response the tool JSON is a JSON string value, so field names appear
+     * as \"fieldname\": (backslash-quote). Search for the unquoted suffix. */
+    const char *p = strstr(r2, "get_code_snippet");
+    ASSERT_NOT_NULL(p);
+    const char *bv = strstr(p, "baseline_tokens\\\":");
+    ASSERT_NOT_NULL(bv);
+    int baseline = 0;
+    sscanf(bv, "baseline_tokens\\\":%d", &baseline);
+    ASSERT(baseline > 0);
+
+    free(r2);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp_dir);
     PASS();
 }
 
@@ -2857,6 +2900,7 @@ SUITE(mcp) {
     /* Token savings reporting */
     RUN_TEST(show_token_savings_empty);
     RUN_TEST(show_token_savings_after_calls);
+    RUN_TEST(tool_savings_baseline_after_snippet);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);

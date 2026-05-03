@@ -32,7 +32,7 @@ Keep the repository friendly for local maintainer workflows on this workstation:
 - Continue reducing `-Werror` warning backlog so focused fixes can be validated with full local builds more reliably.
 - Keep Windows Makefile defaults conservative: default WinLibs `gcc`/`g++` only when callers did not choose compilers explicitly, and document local sanitizer/zlib gaps separately from application regressions.
 - Keep `docs/WINDOWS_SEARCH.md` and `docs/WINDOWS_BINARY_DEPLOY.md` synchronized with the merged implementation and local deployment workflow.
-- Make `show_token_savings` report *actual savings* instead of raw usage. Currently the tool tracks tokens spent on tool calls (args in, response out) but does not compute a delta against what a naive file-read approach would have cost. True savings reporting requires a per-tool baseline cost model — see `docs/roadmap.md` implementation notes below.
+- ✅ `show_token_savings` now reports *actual savings* — per-tool baseline cost model implemented in v0.10.3. `baseline_tokens`, `saved_tokens`, `total_saved_tokens`, and `total_baseline_tokens` fields added. Exact savings for `get_code_snippet`/`manage_adr`; estimated (8 KB/file) for `search_graph`/`search_code`/`get_architecture`/`trace_path`; fixed offset for `detect_changes`.
 - Improve agent-facing MCP trust and query ergonomics so structural answers are easier to trust during active coding:
   - add explicit freshness metadata to query results where practical, including last index/update time, whether the underlying file changed since the indexed snapshot, and the repo revision or cache basis when available
   - make search/trace/architecture results more source-backed by default with exact file paths, line references, and small raw snippets so agents can jump from graph answers to current source truth faster
@@ -50,6 +50,12 @@ Keep the repository friendly for local maintainer workflows on this workstation:
 ## Implementation Notes
 
 ### show_token_savings: true savings vs. raw usage
+
+**Status: ✅ Implemented in v0.10.3.**
+
+`baseline_bytes` field added to `cbm_tool_stats_t`; `record_tool_baseline()` called from inside each handler on success paths. `show_token_savings` now reports `baseline_tokens`, `saved_tokens` (clamped ≥ 0 per tool), and root-level `total_saved_tokens`/`total_baseline_tokens`. Kept below for historical reference.
+
+---
 
 **Problem.** The current implementation (`src/mcp/mcp.c`, `show_token_savings` handler) tracks tokens
 *spent on tool calls* — args JSON size (input) and response size (output), each divided by 4. It does

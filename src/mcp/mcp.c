@@ -1,5 +1,5 @@
 /* Version: 0.10.1 */
-// Version: 0.10.2
+// Version: 0.10.3
 /*
  * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
  *
@@ -88,6 +88,10 @@ enum {
 /* JSON-RPC 2.0 standard error codes */
 #define JSONRPC_PARSE_ERROR (-32700)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
+
+/* Estimated bytes per indexed source file for token savings baseline calculations.
+ * Used as a multiplier when counting unique files in search/architecture results. */
+#define BASELINE_AVG_FILE_BYTES 8000LL
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -267,6 +271,7 @@ typedef struct {
     atomic_llong input_bytes;
     atomic_llong output_bytes;
     atomic_llong time_us;
+    atomic_llong baseline_bytes; /* estimated naive-alternative cost for savings reporting */
 } cbm_tool_stats_t;
 
 static cbm_tool_stats_t g_tool_stats[CBM_TOOL_SLOT_COUNT];
@@ -418,7 +423,9 @@ static const tool_def_t TOOLS[] = {
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
 
     {"show_token_savings",
-     "Report per-tool call counts and estimated input/output token volumes for this server session.",
+     "Report token savings for this server session. "
+     "saved_tokens = estimated naive-alternative cost (reading files directly) minus actual tool cost. "
+     "Headline field: total_saved_tokens. Also reports baseline_tokens, input_tokens, output_tokens per tool.",
      "{\"type\":\"object\",\"properties\":{}}"},
 };
 
@@ -457,11 +464,12 @@ void cbm_tool_stats_reset(void) {
     ensure_stats_mutex();
     cbm_mutex_lock(&g_stats_mtx);
     for (int i = 0; i < TOOL_COUNT; i++) {
-        atomic_store(&g_tool_stats[i].calls,        0);
-        atomic_store(&g_tool_stats[i].errors,       0);
-        atomic_store(&g_tool_stats[i].input_bytes,  0LL);
-        atomic_store(&g_tool_stats[i].output_bytes, 0LL);
-        atomic_store(&g_tool_stats[i].time_us,      0LL);
+        atomic_store(&g_tool_stats[i].calls,          0);
+        atomic_store(&g_tool_stats[i].errors,         0);
+        atomic_store(&g_tool_stats[i].input_bytes,    0LL);
+        atomic_store(&g_tool_stats[i].output_bytes,   0LL);
+        atomic_store(&g_tool_stats[i].time_us,        0LL);
+        atomic_store(&g_tool_stats[i].baseline_bytes, 0LL);
     }
     atomic_store_explicit(&g_tool_stats_ready, false, memory_order_release);
     cbm_mutex_unlock(&g_stats_mtx);
@@ -478,6 +486,21 @@ static void record_tool_stats(const char *tool_name, long long input_bytes,
             atomic_fetch_add(&g_tool_stats[i].output_bytes, output_bytes);
             atomic_fetch_add(&g_tool_stats[i].time_us,      dur_us);
             if (is_error) atomic_fetch_add(&g_tool_stats[i].errors, 1);
+            return;
+        }
+    }
+}
+
+/* Called from inside a handler to record the estimated naive-alternative cost.
+ * baseline_bytes = what the agent would have spent reading files directly.
+ * Net savings = baseline_bytes - actual_input_bytes - actual_output_bytes,
+ * computed at report time in handle_show_token_savings. */
+static void record_tool_baseline(const char *tool_name, long long baseline_bytes) {
+    if (baseline_bytes <= 0) return;
+    ensure_tool_stats_init();
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(g_tool_stats[i].name, tool_name) == 0) {
+            atomic_fetch_add(&g_tool_stats[i].baseline_bytes, baseline_bytes);
             return;
         }
     }
@@ -554,7 +577,7 @@ char *cbm_mcp_initialize_response(const char *params_json) {
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
-    yyjson_mut_obj_add_str(doc, impl, "version", "0.10.0");
+    yyjson_mut_obj_add_str(doc, impl, "version", "0.10.3");
     yyjson_mut_obj_add_val(doc, root, "serverInfo", impl);
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
@@ -2034,12 +2057,33 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_search_output_t out = {0};
     yyjson_mut_doc *doc = NULL;
     yyjson_mut_val *root = NULL;
+    int sg_unique_files = 0; /* unique file paths across results — for savings baseline */
 
     if (query && query[0]) {
         char *bm25_json = bm25_search(store, &params, query);
         if (bm25_json) {
             yyjson_doc *bm25_doc = yyjson_read(bm25_json, strlen(bm25_json), 0);
             if (bm25_doc) {
+                /* Count unique file_paths from immutable bm25_doc BEFORE copying/freeing */
+                yyjson_val *bm25_root_ = yyjson_doc_get_root(bm25_doc);
+                yyjson_val *bm25_res_  = yyjson_obj_get(bm25_root_, "results");
+                if (bm25_res_ && yyjson_is_arr(bm25_res_)) {
+                    const char *sg_seen_[256];
+                    int sg_seen_n_ = 0;
+                    size_t bi_idx_, bi_max_; yyjson_val *bi_item_;
+                    yyjson_arr_foreach(bm25_res_, bi_idx_, bi_max_, bi_item_) {
+                        if (sg_seen_n_ >= 256) break;
+                        yyjson_val *fp_v_ = yyjson_obj_get(bi_item_, "file_path");
+                        const char *fp_  = yyjson_get_str(fp_v_);
+                        if (!fp_) continue;
+                        bool dup_ = false;
+                        for (int si_ = 0; si_ < sg_seen_n_; si_++) {
+                            if (strcmp(sg_seen_[si_], fp_) == 0) { dup_ = true; break; }
+                        }
+                        if (!dup_) sg_seen_[sg_seen_n_++] = fp_;
+                    }
+                    sg_unique_files = sg_seen_n_;
+                }
                 doc = yyjson_doc_mut_copy(bm25_doc, NULL);
                 yyjson_doc_free(bm25_doc);
             }
@@ -2061,6 +2105,19 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     if (!doc) {
         cbm_store_search(store, &params, &out);
+        /* Count unique file_paths for baseline (O(n²); result sets bounded by limit) */
+        for (int sgi_ = 0; sgi_ < out.count; sgi_++) {
+            const char *fp_ = out.results[sgi_].node.file_path;
+            if (!fp_) continue;
+            bool dup_ = false;
+            for (int sgj_ = 0; sgj_ < sgi_; sgj_++) {
+                if (out.results[sgj_].node.file_path &&
+                    strcmp(fp_, out.results[sgj_].node.file_path) == 0) {
+                    dup_ = true; break;
+                }
+            }
+            if (!dup_) sg_unique_files++;
+        }
         doc = yyjson_mut_doc_new(NULL);
         root = yyjson_mut_obj(doc);
         yyjson_mut_doc_set_root(doc, root);
@@ -2085,6 +2142,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             "into individual keywords; each is scored independently via per-keyword "
             "min-cosine.",
             true);
+    }
+
+    /* Record baseline after successful dispatch (after sq_type_error guard) */
+    if (sg_unique_files > 0) {
+        record_tool_baseline("search_graph",
+            (long long)sg_unique_files * BASELINE_AVG_FILE_BYTES);
     }
 
     char *json = yy_doc_to_str(doc);
@@ -2354,6 +2417,20 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
     }
 
+    /* Approximate baseline: cost to read all indexed source files directly */
+    {
+        char **arch_files_ = NULL;
+        int arch_fcount_ = 0;
+        if (cbm_store_list_files(store, project, &arch_files_, &arch_fcount_) == CBM_STORE_OK) {
+            if (arch_fcount_ > 0) {
+                record_tool_baseline("get_architecture",
+                    (long long)arch_fcount_ * BASELINE_AVG_FILE_BYTES);
+            }
+            for (int afi_ = 0; afi_ < arch_fcount_; afi_++) free(arch_files_[afi_]);
+            free(arch_files_);
+        }
+    }
+
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     cbm_store_schema_free(&schema);
@@ -2554,6 +2631,34 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    /* Baseline: unique files an agent would need to open to follow the call chain manually.
+     * Dedup across both outbound and inbound directions; pointers valid until traverse_free. */
+    {
+        const char *tr_seen_[256];
+        int tr_nseen_ = 0;
+        for (int tri_ = 0; tri_ < tr_out.visited_count && tr_nseen_ < 256; tri_++) {
+            const char *fp_ = tr_out.visited[tri_].node.file_path;
+            if (!fp_ || !fp_[0]) continue;
+            bool dup_ = false;
+            for (int trk_ = 0; trk_ < tr_nseen_; trk_++) {
+                if (strcmp(tr_seen_[trk_], fp_) == 0) { dup_ = true; break; }
+            }
+            if (!dup_) tr_seen_[tr_nseen_++] = fp_;
+        }
+        for (int tri_ = 0; tri_ < tr_in.visited_count && tr_nseen_ < 256; tri_++) {
+            const char *fp_ = tr_in.visited[tri_].node.file_path;
+            if (!fp_ || !fp_[0]) continue;
+            bool dup_ = false;
+            for (int trk_ = 0; trk_ < tr_nseen_; trk_++) {
+                if (strcmp(tr_seen_[trk_], fp_) == 0) { dup_ = true; break; }
+            }
+            if (!dup_) tr_seen_[tr_nseen_++] = fp_;
+        }
+        if (tr_nseen_ > 0) {
+            record_tool_baseline("trace_path", (long long)tr_nseen_ * BASELINE_AVG_FILE_BYTES);
+        }
+    }
 
     /* Now safe to free traversal data */
     if (do_outbound) {
@@ -2895,6 +3000,11 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
     char *abs_path = NULL;
     char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+    /* Exact baseline: cost to read the full file vs. this snippet */
+    if (source && abs_path) {
+        long long file_sz = cbm_file_size(abs_path);
+        if (file_sz > 0) record_tool_baseline("get_code_snippet", file_sz);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -3105,6 +3215,11 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         char *source = resolve_snippet_source(root_path, file_arg,
                            start_line, end_line, &abs_path);
         free(root_path);
+        /* Exact baseline: cost to read the full file vs. this raw snippet */
+        if (source && abs_path) {
+            long long file_sz = cbm_file_size(abs_path);
+            if (file_sz > 0) record_tool_baseline("get_code_snippet", file_sz);
+        }
         if (!source) {
             free(abs_path); free(file_arg); free(project);
             return cbm_mcp_text_result("file not found or not readable", true);
@@ -4234,6 +4349,39 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
                                           context_lines, root_path);
+
+    /* Baseline: count unique files in the actually emitted result set.
+     * Mirrors assemble_search_output: min(sr_count,limit) graph results
+     * plus min(raw_count,20) raw matches — same caps used during output. */
+    {
+        int sc_out_ = sr_count  < limit ? sr_count  : limit;
+        int sc_raw_ = raw_count < 20    ? raw_count : 20;
+        const char *sc_seen_[256];
+        int sc_nseen_ = 0;
+        for (int sci_ = 0; sci_ < sc_out_ && sc_nseen_ < 256; sci_++) {
+            const char *fp_ = sr[sci_].file;
+            if (!fp_[0]) continue;
+            bool dup_ = false;
+            for (int sck_ = 0; sck_ < sc_nseen_; sck_++) {
+                if (strcmp(sc_seen_[sck_], fp_) == 0) { dup_ = true; break; }
+            }
+            if (!dup_) sc_seen_[sc_nseen_++] = fp_;
+        }
+        for (int rci_ = 0; rci_ < sc_raw_ && sc_nseen_ < 256; rci_++) {
+            const char *fp_ = raw[rci_].file;
+            if (!fp_[0]) continue;
+            bool dup_ = false;
+            for (int sck_ = 0; sck_ < sc_nseen_; sck_++) {
+                if (strcmp(sc_seen_[sck_], fp_) == 0) { dup_ = true; break; }
+            }
+            if (!dup_) sc_seen_[sc_nseen_++] = fp_;
+        }
+        if (sc_nseen_ > 0) {
+            record_tool_baseline("search_code",
+                (long long)sc_nseen_ * BASELINE_AVG_FILE_BYTES);
+        }
+    }
+
     free(gm);
     free(sr);
     free(raw);
@@ -4364,6 +4512,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
     yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
 
+    /* Baseline: fixed estimate for running git diff and parsing output manually */
+    record_tool_baseline("detect_changes", 4000LL);
+
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     free(root_path);
@@ -4454,6 +4605,12 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char adr_path[CBM_SZ_4K];
     snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
 
+    /* Baseline: cost to open and read the ADR file (skip for update — that's a write) */
+    if (!(strcmp(mode_str, "update") == 0 && content)) {
+        long long adr_sz_ = cbm_file_size(adr_path);
+        if (adr_sz_ > 0) record_tool_baseline("manage_adr", adr_sz_);
+    }
+
     char *adr_buf = NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -4535,6 +4692,7 @@ static char *handle_show_token_savings(cbm_mcp_server_t *srv, const char *args) 
 
     long long total_calls = 0, total_errors = 0;
     long long total_in_bytes = 0, total_out_bytes = 0;
+    long long total_baseline_bytes = 0, total_saved_bytes = 0;
     yyjson_mut_val *tools_arr = yyjson_mut_arr(doc);
 
     for (int i = 0; i < TOOL_COUNT; i++) {
@@ -4542,32 +4700,45 @@ static char *handle_show_token_savings(cbm_mcp_server_t *srv, const char *args) 
         long long calls = (long long)atomic_load(&s->calls);
         if (calls == 0) continue;
 
-        long long in_b  = (long long)atomic_load(&s->input_bytes);
-        long long out_b = (long long)atomic_load(&s->output_bytes);
-        long long errs  = (long long)atomic_load(&s->errors);
+        long long in_b   = (long long)atomic_load(&s->input_bytes);
+        long long out_b  = (long long)atomic_load(&s->output_bytes);
+        long long errs   = (long long)atomic_load(&s->errors);
+        long long base_b = (long long)atomic_load(&s->baseline_bytes);
+        long long saved_b = base_b - in_b - out_b;
+        if (saved_b < 0) saved_b = 0;
 
         yyjson_mut_val *entry = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, entry, "tool",          s->name);
-        yyjson_mut_obj_add_int(doc, entry, "calls",         (int64_t)calls);
-        yyjson_mut_obj_add_int(doc, entry, "errors",        (int64_t)errs);
-        yyjson_mut_obj_add_int(doc, entry, "input_tokens",  (int64_t)((in_b  + 3) / 4));
-        yyjson_mut_obj_add_int(doc, entry, "output_tokens", (int64_t)((out_b + 3) / 4));
+        yyjson_mut_obj_add_str(doc, entry, "tool",             s->name);
+        yyjson_mut_obj_add_int(doc, entry, "calls",            (int64_t)calls);
+        yyjson_mut_obj_add_int(doc, entry, "errors",           (int64_t)errs);
+        yyjson_mut_obj_add_int(doc, entry, "saved_tokens",     (int64_t)((saved_b + 3) / 4));
+        yyjson_mut_obj_add_int(doc, entry, "baseline_tokens",  (int64_t)((base_b  + 3) / 4));
+        yyjson_mut_obj_add_int(doc, entry, "input_tokens",     (int64_t)((in_b    + 3) / 4));
+        yyjson_mut_obj_add_int(doc, entry, "output_tokens",    (int64_t)((out_b   + 3) / 4));
         yyjson_mut_arr_append(tools_arr, entry);
 
-        total_calls     += calls;
-        total_errors    += errs;
-        total_in_bytes  += in_b;
-        total_out_bytes += out_b;
+        total_calls          += calls;
+        total_errors         += errs;
+        total_in_bytes       += in_b;
+        total_out_bytes      += out_b;
+        total_baseline_bytes += base_b;
+        total_saved_bytes    += saved_b; /* sum of per-tool clamped saved values */
     }
 
+    /* Headline: savings first */
+    yyjson_mut_obj_add_int(doc, root, "total_saved_tokens",
+        (int64_t)((total_saved_bytes    + 3) / 4));
+    yyjson_mut_obj_add_int(doc, root, "total_baseline_tokens",
+        (int64_t)((total_baseline_bytes + 3) / 4));
     yyjson_mut_obj_add_int(doc, root, "total_calls",         (int64_t)total_calls);
     yyjson_mut_obj_add_int(doc, root, "total_errors",        (int64_t)total_errors);
     yyjson_mut_obj_add_int(doc, root, "total_input_tokens",  (int64_t)((total_in_bytes  + 3) / 4));
     yyjson_mut_obj_add_int(doc, root, "total_output_tokens", (int64_t)((total_out_bytes + 3) / 4));
     yyjson_mut_obj_add_val(doc, root, "by_tool",             tools_arr);
     yyjson_mut_obj_add_str(doc, root, "note",
-        "Token estimates: bytes / 4 (ceiling). Input = args JSON size. "
-        "Output = tool response size before update-notice injection. "
+        "saved_tokens = baseline - (input + output), clamped to 0 per tool. "
+        "total_saved_tokens is the sum of per-tool saved values. "
+        "baseline = estimated naive-alternative cost (file reads/grep). "
         "Stats are process-wide (stdio + HTTP); this call is not included in the totals.");
 
     char *json = yy_doc_to_str(doc);
